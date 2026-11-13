@@ -1,0 +1,244 @@
+#include "uci.hpp"
+#include "book.hpp"
+#include "eval.hpp"
+#include "search.hpp"
+#include "tb.hpp"
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <thread>
+
+using namespace chess;
+
+static const char* BENCH_FENS[] = {
+    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+    "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4",
+    "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+    "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+    "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+    "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+    "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+    "2r3k1/pp3ppp/8/3P4/8/P4P2/1P4PP/2R3K1 b - - 0 1",
+    "8/5pk1/6p1/8/3P4/6P1/5PK1/8 w - - 0 1",
+    "r1b2rk1/2q1bppp/p2p1n2/np2p3/3PP3/1BN2N1P/PPB2PP1/R1BQR1K1 w - - 0 1",
+    "6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1",
+    "3r2k1/p4ppp/1p6/8/2P5/1P3P2/P5PP/3R2K1 w - - 0 1"};
+
+void runBench(int depth) {
+    tbSetEnabled(false);                             // tablebases off so bench node counts stay fixed
+    const size_t oldHash = hashSizeMB();             // NEW (first lines)
+    const int oldThreads = threadCount();
+    setHashSize(16);                                 // NEW: fixed table size so bench numbers don't depend on Hash
+    setThreads(1);                                   // one thread: multi-threaded node counts are not reproducible
+    setSearchInfo(false);
+    uint64_t total = 0;
+    auto t0 = std::chrono::steady_clock::now();
+    for (const char* fen : BENCH_FENS) {
+        clearTT();                                   // every position starts from a clean slate
+        Board b(fen);
+        search(b, depth, 1000000000);
+        total += searchNodes();
+    }
+    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    std::cout << "Nodes searched: " << total << "\nTime: " << (long long)ms << " ms\nNPS: "
+              << (long long)(total / (ms / 1000.0)) << std::endl;
+    setSearchInfo(true);
+    setHashSize(oldHash);                            // NEW (last line): put the Hash setting back
+    setThreads(oldThreads);
+    tbSetEnabled(true);
+}
+
+// Splits the clock into a soft target and a hard cap for this move.
+// Sudden death: ~1/30 of the clock plus most of the increment. With movestogo: spread the clock over
+// the moves left to the next time control. The hard cap is a few times the soft target but always
+// a safe fraction of what is left, so one deep search can never flag us.
+static void allocateTime(int64_t clock, int64_t inc, int movestogo, int overhead, SearchLimits& lim) {
+    const double avail = (double)std::max<int64_t>(1, clock - overhead);
+    const int mtg = movestogo > 0 ? std::min(movestogo, 50) : 30;
+    double soft = avail / mtg + inc * 0.75;
+    if (mtg == 1) soft = avail * 0.7;                    // last move before the control: use most of it
+    const double hardFrac = mtg == 1 ? 0.90 : (mtg <= 3 ? 0.60 : 0.40);
+    double hard = std::min(soft * 5.0, avail * hardFrac);
+    hard = std::max(hard, 1.0);
+    soft = std::max(1.0, std::min(soft, hard));
+    lim.softMs = (int64_t)soft;
+    lim.hardMs = (int64_t)hard;
+    lim.dynamic = true;
+}
+
+static bool g_ponderOption = false;     // UCI option "Ponder": only then do we append "ponder <move>"
+
+// While "go ponder" has not been confirmed (ponderhit) or cancelled (stop), UCI forbids sending bestmove.
+static void waitWhilePondering() {
+    while (isPondering() && !stopRequested())
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+}
+
+// Runs on its own thread so the main loop can still read "stop" / "quit" while thinking.
+static void thinkAndReply(Board work, SearchLimits lim) {
+    const Board root = work;             // search() leaves its board mid-search on timeout
+    Move m;
+    const std::string bm = bookMove(work);
+    if (!bm.empty()) m = uci::uciToMove(root, bm);     // book move: no search, the ponder move comes from a quick one
+    else             m = search(work, lim);
+    waitWhilePondering();                // search may finish early (forced move, mate, depth limit) while pondering
+    if (m == Move()) {
+        std::cout << "bestmove 0000" << std::endl;
+        return;
+    }
+    std::cout << "bestmove " << uci::moveToUci(m);
+    if (g_ponderOption) {
+        const Move p = ponderMoveFor(root, m);
+        if (!(p == Move())) std::cout << " ponder " << uci::moveToUci(p);
+    }
+    std::cout << std::endl;
+}
+
+void uciLoop() {
+    Board board(constants::STARTPOS);
+    std::string line;
+    std::thread worker;
+    int moveOverhead = 50;                 // ms kept in reserve for GUI / network lag
+
+    auto finishSearch = [&]() {
+        requestStop();
+        if (worker.joinable()) worker.join();
+    };
+
+    while (std::getline(std::cin, line)) {
+        std::istringstream ss(line);
+        std::string cmd;
+        ss >> cmd;
+
+        if (cmd == "uci") {
+            std::cout << "id name MyChessAI\nid author me\n"
+                      << "option name BookFile type string default Perfect2023.bin\n"
+                      << "option name MoveOverhead type spin default 50 min 0 max 5000\n"
+                      << "option name Hash type spin default 64 min 1 max 65536\n"
+                      << "option name Threads type spin default 1 min 1 max 256\n"
+                      << "option name Ponder type check default false\n"
+                      << "option name Clear Hash type button\n"
+                      << "option name EvalFile type string default <empty>\n"
+                      << "option name SyzygyPath type string default syzygy\n"
+                      << "option name SyzygyProbeDepth type spin default 1 min 1 max 100\n"
+                      << "uciok" << std::endl;
+        } else if (cmd == "isready") {
+            std::cout << "readyok" << std::endl;
+        } else if (cmd == "setoption") {
+            std::string tok, name, value;
+            ss >> tok;                                   // "name"
+            while (ss >> tok && tok != "value") name += (name.empty() ? "" : " ") + tok;
+            while (ss >> tok) value += (value.empty() ? "" : " ") + tok;
+            if (name == "BookFile") {
+                if (!loadBook(value)) std::cerr << "Warning: could not load book " << value << std::endl;
+            } else if (name == "MoveOverhead") {
+                moveOverhead = std::max(0, std::atoi(value.c_str()));
+            } else if (name == "Hash") {
+                finishSearch();                          // the table must not be resized mid-search
+                setHashSize((size_t)std::max(1, std::atoi(value.c_str())));
+            } else if (name == "Threads") {
+                finishSearch();                          // helper state must not change under a running search
+                setThreads(std::atoi(value.c_str()));
+            } else if (name == "Ponder") {
+                g_ponderOption = (value == "true");
+            } else if (name == "EvalFile") {
+                finishSearch();                          // never swap the eval under a running search
+                if (value.empty() || value == "<empty>") {
+                    unloadNNUE();
+                    clearTT();
+                    std::cout << "info string NNUE off, using the handcrafted eval" << std::endl;
+                } else {
+                    std::string err;
+                    if (loadNNUE(value, &err)) {
+                        clearTT();                       // stored scores came from the old eval
+                        std::cout << "info string NNUE loaded: " << value << std::endl;
+                    } else {
+                        std::cout << "info string could not load net '" << value << "': " << err << std::endl;
+                    }
+                }
+            } else if (name == "SyzygyPath") {
+                finishSearch();                          // never swap tables under a running search
+                if (!tbInit(value)) std::cerr << "Warning: no Syzygy tables found in '" << value << "'" << std::endl;
+                else std::cout << "info string Syzygy tables loaded, up to " << tbLargest() << " pieces" << std::endl;
+            } else if (name == "SyzygyProbeDepth") {
+                tbSetProbeDepth(std::atoi(value.c_str()));
+            } else if (name == "Clear Hash") {
+                finishSearch();
+                clearTT();
+            }
+        } else if (cmd == "ucinewgame") {
+            finishSearch();
+            clearTT();
+        } else if (cmd == "position") {
+            finishSearch();
+            std::string t;
+            ss >> t;
+            if (t == "startpos") {
+                board = Board(constants::STARTPOS);
+                ss >> t;
+            } else {
+                std::string fen;
+                while (ss >> t && t != "moves") fen += (fen.empty() ? "" : " ") + t;
+                board = Board(fen);
+            }
+            if (t == "moves") {
+                std::string mv;
+                while (ss >> mv) board.makeMove(uci::uciToMove(board, mv));
+            }
+        } else if (cmd == "go") {
+            finishSearch();
+            int wtime = -1, btime = -1, winc = 0, binc = 0, movetime = -1, movestogo = -1, depth = 64;
+            bool depthGiven = false, infinite = false, ponder = false;
+            std::string tok;
+            while (ss >> tok) {
+                if (tok == "wtime") ss >> wtime;
+                else if (tok == "btime") ss >> btime;
+                else if (tok == "winc") ss >> winc;
+                else if (tok == "binc") ss >> binc;
+                else if (tok == "movestogo") ss >> movestogo;
+                else if (tok == "movetime") ss >> movetime;
+                else if (tok == "depth") { ss >> depth; depthGiven = true; }
+                else if (tok == "infinite") infinite = true;
+                else if (tok == "ponder") ponder = true;
+            }
+
+            SearchLimits lim;
+            lim.maxDepth = depth;
+            lim.infinite = infinite;
+            if (movetime > 0) {
+                lim.softMs = lim.hardMs = std::max(1, movetime - moveOverhead);   // fixed time: use all of it
+            } else {
+                bool white = board.sideToMove() == Color::WHITE;
+                int clock = white ? wtime : btime, inc = white ? winc : binc;
+                if (clock >= 0) allocateTime(clock, inc, movestogo, moveOverhead, lim);
+                else if (!depthGiven && !infinite) lim.softMs = lim.hardMs = 3000;
+                // else: fixed depth / analysis, no cut-off
+            }
+
+            resetStop();
+            setPondering(ponder);                // before the worker starts, so an early "ponderhit" is not lost
+            worker = std::thread(thinkAndReply, board, lim);
+
+        } else if (cmd == "ponderhit") {
+            ponderHit();                         // the opponent played our predicted move: start the clock
+
+        } else if (cmd == "bench") {
+            int d = 0;
+            ss >> d;
+            if (d <= 0) d = 9;
+            finishSearch();
+            resetStop();
+            setPondering(false);
+            runBench(d);
+               
+        } else if (cmd == "stop") {
+            finishSearch();                       // the worker prints "bestmove" as it unwinds
+        } else if (cmd == "quit") {
+            break;
+        }
+    }
+    finishSearch();
+}
