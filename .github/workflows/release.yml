@@ -32,7 +32,7 @@ jobs:
           cp README.md LICENSE THIRD_PARTY_NOTICES.md dist/ 2>/dev/null || true
           [ -d nets ] && cp -r nets dist/ || true
           cd dist && sha256sum niikoo.exe > SHA256SUMS.txt
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/niikoo.exe
