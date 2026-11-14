@@ -1,5 +1,7 @@
 # Niikoo
 
+![CI](https://github.com/Perfyyyyy/Niikoo/actions/workflows/ci.yml/badge.svg)
+
 A UCI chess engine written in C++17 with a neural-network evaluation (NNUE) trained on Stockfish evaluations of
 positions from the Lichess database. (Self play data will be added in the future)
 
