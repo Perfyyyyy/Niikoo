@@ -114,7 +114,7 @@ void uciLoop() {
         ss >> cmd;
 
         if (cmd == "uci") {
-            std::cout << "id name MyChessAI\nid author me\n"
+            std::cout << "id name Niikoo\nid author Perfyyyyy\n"
                       << "option name BookFile type string default Perfect2023.bin\n"
                       << "option name MoveOverhead type spin default 50 min 0 max 5000\n"
                       << "option name Hash type spin default 64 min 1 max 65536\n"

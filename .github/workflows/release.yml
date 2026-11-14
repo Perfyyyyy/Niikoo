@@ -1,0 +1,40 @@
+name: Release
+
+# Push a tag like v1.0.0 to build the Windows exe and attach it to a GitHub Release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-gcc
+      - name: Build (AVX2, static)
+        run: make -j4 ARCH=-mavx2
+      - name: Package
+        run: |
+          mkdir dist
+          cp niikoo.exe dist/
+          cp README.md LICENSE THIRD_PARTY_NOTICES.md dist/ 2>/dev/null || true
+          [ -d nets ] && cp -r nets dist/ || true
+          cd dist && sha256sum niikoo.exe > SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/niikoo.exe
+            dist/SHA256SUMS.txt
+          generate_release_notes: true

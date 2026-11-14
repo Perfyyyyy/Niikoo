@@ -1,0 +1,7 @@
+version: 2
+updates:
+  # keeps the actions used in the workflows (checkout, setup-python, ...) up to date
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"

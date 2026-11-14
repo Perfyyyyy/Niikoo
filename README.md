@@ -21,7 +21,7 @@ Put the network file next to the exe and load it with `setoption name EvalFile v
 ## Build
 Requires GNU Make and a C++17 compiler (MSYS2 UCRT64 on Windows).
 ```
-make -j8                  # builds chess-ai.exe
+make -j8                  # builds niikoo.exe
 make bench                # fixed-depth benchmark (node count must not change in refactors)
 make bench NET=nets/net.bin
 ```

@@ -1,4 +1,4 @@
-# Makefile -> builds chess-ai.exe (Windows only)
+# Makefile -> builds niikoo.exe (Windows only)
 #
 #   On Windows (MSYS2 UCRT64 / MINGW64 terminal):   make -j8
 #   On Linux / GitHub Codespaces (cross-compile):   sudo apt install g++-mingw-w64-x86-64-posix gcc-mingw-w64-x86-64-posix
@@ -6,7 +6,7 @@
 #
 #   make ARCH=-march=native    tune for the CPU you build on (only if you run the exe on that same PC)
 #   make ARCH=-mavx2           default when cross-compiling: runs on any AVX2 CPU
-#   make verify                slow debug build that checks every incremental NNUE update -> chess-ai-verify.exe
+#   make verify                slow debug build that checks every incremental NNUE update -> niikoo-verify.exe
 #   make bench [NET=net.bin]   run "bench" (on Linux this needs wine)
 #   make clean
 
@@ -94,6 +94,6 @@ bench: $(EXE)
 	else printf 'bench 9\nquit\n' | $(RUN) ./$(EXE); fi
 
 clean:
-	rm -rf build chess-ai.exe chess-ai-verify.exe
+	rm -rf build niikoo.exe niikoo-verify.exe
 
 -include $(OBJS:.o=.d)
