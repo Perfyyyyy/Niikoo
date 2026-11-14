@@ -1,0 +1,10 @@
+# consistent line endings (Windows + Linux)
+* text=auto eol=lf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# binary files: never diff or merge
+*.bin binary
+*.nnue binary
+*.exe binary
+*.zip binary

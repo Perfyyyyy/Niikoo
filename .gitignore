@@ -1,0 +1,32 @@
+# build output
+build/
+*.o
+*.d
+*.exe
+*.out
+nnue_tools/nnue_test
+
+# NNUE training data and checkpoints (large, never commit)
+data/
+data_zst/
+smalldata/
+*.zst
+train.bin
+small.bin
+checkpoint*.pt
+*.pt
+train_log*.txt
+prep_log*.txt
+
+# match results and tooling output
+results/
+*.pgn
+
+# editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc
