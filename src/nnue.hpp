@@ -73,6 +73,16 @@ void copyPerspective(Accumulator& dst, const Accumulator& src, int perspective);
 void addFeature(Accumulator& acc, int perspective, int feature);
 void subFeature(Accumulator& acc, int perspective, int feature);
 
+// ---- raw single-perspective operations (fused updates and the search's king-bucket refresh cache) ----
+// `a`, `dst`, `src` point at hiddenSize() int16 values (one perspective of an Accumulator, or any array of that size).
+uint32_t netId();                                  // changes whenever a net is loaded or unloaded (cache invalidation)
+void loadBias(int16_t* dst);                       // dst = first-layer bias
+void addFeatureRaw(int16_t* a, int feature);
+void subFeatureRaw(int16_t* a, int feature);
+// dst = src - sum(w[subs[0..ns)]) + sum(w[adds[0..na)]) in ONE pass (ns, na in 0..4). dst may equal src.
+// Bit-identical to copying src and then calling subFeatureRaw / addFeatureRaw for each feature.
+void updatePerspective(int16_t* dst, const int16_t* src, const int* subs, int ns, const int* adds, int na);
+
 // SIMD (AVX2) paths are chosen at run time when the CPU supports them (no special compiler flag needed); the results
 // are bit-identical to the plain C++ code. setSimd(false) forces the plain code (for tests and comparisons).
 void setSimd(bool on);

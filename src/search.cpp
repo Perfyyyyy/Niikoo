@@ -228,6 +228,15 @@ static int hashfull() {
 
 // ---------- per-thread search state ----------
 // Everything a search thread writes while searching lives here, so threads never share it.
+// King-bucket refresh cache ("Finny table"): for each perspective and each king key (bucket << 1 | mirror) it keeps the
+// accumulator that was last built for that key together with the piece placement it contains. Refreshing a perspective
+// then only applies the difference to that placement (usually a few pieces) instead of re-adding every piece.
+struct FinnyEntry {
+    alignas(64) int16_t v[nnue::MAX_HIDDEN];
+    uint64_t pcs[2][6];                           // [colour][piece type] bitboards that v was built from
+    bool     valid = false;
+};
+
 struct ThreadData {
     int      id = 0;                              // 0 = main thread (prints info, manages time)
     uint64_t nodes = 0;
@@ -252,6 +261,8 @@ struct ThreadData {
     bool     accValid[MAX_PLY + 2];
     uint8_t  accKey[MAX_PLY + 2][2];              // v2 net: king key (bucket, mirror) each perspective of acc[p] was built with
     bool     useNN = false;                       // a net is loaded: evaluate with it
+    FinnyEntry finny[2][32];                      // [perspective][king key]; key = (bucket << 1) | mirror < 2 * KING_BUCKETS
+    uint32_t finnyNetId = 0;                      // net the cache belongs to (nnue::netId()); stale entries are dropped at the root
     // principal variation (triangular table): pv[ply][ply .. pvLen[ply]-1] is the line found from that ply
     Move     pv[MAX_PLY + 2][MAX_PLY + 2];
     int      pvLen[MAX_PLY + 2];
@@ -342,16 +353,30 @@ static void accRefreshPerspective(ThreadData& td, const Board& b, int ply, int j
 #endif
     const int key = pcs[p][5] ? nnue::kingKey(p, __builtin_ctzll(pcs[p][5])) : 0;
     td.accKey[j][p] = (uint8_t)key;
-    nnue::resetPerspective(td.acc[j], p);
+    // Bring the cached accumulator for this (perspective, king key) up to date with the piece placement, then copy it.
+    FinnyEntry& fe = td.finny[p][key];
+    if (!fe.valid) {                                   // empty cache entry = bias with no pieces
+        nnue::loadBias(fe.v);
+        std::memset(fe.pcs, 0, sizeof(fe.pcs));
+        fe.valid = true;
+    }
     for (int c = 0; c < 2; ++c)
         for (int pt = 0; pt < 6; ++pt) {
-            uint64_t bb = pcs[c][pt];
-            while (bb) {
-                const int sq = __builtin_ctzll(bb);
-                bb &= bb - 1;
-                nnue::addFeature(td.acc[j], p, nnue::featureIndex(p, key, c, pt, sq));
+            const uint64_t cur = pcs[c][pt], old = fe.pcs[c][pt];
+            uint64_t rem = old & ~cur, add = cur & ~old;
+            while (rem) {
+                const int sq = __builtin_ctzll(rem);
+                rem &= rem - 1;
+                nnue::subFeatureRaw(fe.v, nnue::featureIndex(p, key, c, pt, sq));
             }
+            while (add) {
+                const int sq = __builtin_ctzll(add);
+                add &= add - 1;
+                nnue::addFeatureRaw(fe.v, nnue::featureIndex(p, key, c, pt, sq));
+            }
+            fe.pcs[c][pt] = cur;
         }
+    std::memcpy(td.acc[j].v[p], fe.v, (size_t)nnue::hiddenSize() * sizeof(int16_t));
 }
 
 // Brings acc[ply] up to date: finds the nearest ancestor whose accumulator is valid and applies the deltas of
@@ -360,7 +385,6 @@ static void accUpdateTo(ThreadData& td, const Board& b, int ply) {
     int k = ply;
     while (k > 0 && !td.accValid[k]) --k;
     for (int j = k + 1; j <= ply; ++j) {
-        nnue::copy(td.acc[j], td.acc[j - 1]);
         const ThreadData::AccDelta& d = td.delta[j];
         for (int p = 0; p < 2; ++p) {
             int key = td.accKey[j - 1][p];
@@ -371,10 +395,12 @@ static void accUpdateTo(ThreadData& td, const Board& b, int ply) {
                 continue;
             }
             td.accKey[j][p] = (uint8_t)key;
-            for (int i = 0; i < d.nsub; ++i)
-                nnue::subFeature(td.acc[j], p, nnue::featureIndex(p, key, d.sub[i].colour, d.sub[i].pt, d.sub[i].sq));
-            for (int i = 0; i < d.nadd; ++i)
-                nnue::addFeature(td.acc[j], p, nnue::featureIndex(p, key, d.add[i].colour, d.add[i].pt, d.add[i].sq));
+            int subs[2], adds[2];
+            for (int i = 0; i < d.nsub; ++i) subs[i] = nnue::featureIndex(p, key, d.sub[i].colour, d.sub[i].pt, d.sub[i].sq);
+            for (int i = 0; i < d.nadd; ++i) adds[i] = nnue::featureIndex(p, key, d.add[i].colour, d.add[i].pt, d.add[i].sq);
+            // acc[j] = acc[j-1] -/+ the move's features, written in one pass (no separate copy). A refreshed
+            // perspective (above) is written completely by accRefreshPerspective instead.
+            nnue::updatePerspective(td.acc[j].v[p], td.acc[j - 1].v[p], subs, d.nsub, adds, d.nadd);
         }
         td.accValid[j] = true;
     }
@@ -406,6 +432,10 @@ static inline int evalAt(ThreadData& td, const Board& b, int ply) {
 static int rootEval(ThreadData& td, const Board& b) {
     td.useNN = nnue::loaded();
     if (td.useNN) {
+        if (td.finnyNetId != nnue::netId()) {          // a different net was loaded: cached accumulators are meaningless
+            for (auto& perPersp : td.finny) for (FinnyEntry& fe : perPersp) fe.valid = false;
+            td.finnyNetId = nnue::netId();
+        }
         nnueRefresh(b, td.acc[0]);
         for (int p = 0; p < 2; ++p) {
             const uint64_t k = b.pieces(PieceType::KING, p == 0 ? Color::WHITE : Color::BLACK).getBits();
