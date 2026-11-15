@@ -1,10 +1,15 @@
 #pragma once
-// NNUE v2: king-bucketed 768 inputs -> HIDDEN (per perspective, shared weights) -> concat(us, them) -> SCReLU
-// -> one of 8 output layers (chosen by piece count).
+// NNUE v3.
+//   king-bucketed inputs (16 buckets x 768) -> L1 int16 accumulator per perspective (shared weights)
+//   -> clamp [0,255] and pairwise product of the two halves (L1/2 values per perspective, concatenated: L1 values)
+//   -> dense 16 -> dense 32 -> dense 1 (clipped ReLU); every dense layer has one weight set per output bucket,
+//      chosen by the number of pieces on the board.
 //
-// Input feature = (piece colour relative to the perspective, piece type, square relative to the perspective),
-// in the block of the perspective's own king bucket. When that king stands on files e-h the board is mirrored
-// left-right for that perspective, so only 4 king files (and 8 buckets) are needed.
+// Input feature (per perspective p, for each piece):  kingBucket * 768 + (relColour * 6 + pieceType) * 64 + square
+//   * squares are seen from p's side (vertical flip for black),
+//   * if p's own king stands on files e-h, the board is mirrored horizontally for that perspective, so the king is
+//     always on files a-d,
+//   * kingBucket (0..15) comes from the (mirrored) king square, see KING_BUCKET below.
 // The net is loaded from a file written by nnue_tools/train.py (format: see nnue.cpp).
 #include <cstdint>
 #include <string>
@@ -12,9 +17,11 @@
 namespace nnue {
 
 constexpr int NUM_FEATURES   = 768;      // per king bucket
-constexpr int KING_BUCKETS   = 8;
+constexpr int KING_BUCKETS   = 16;
 constexpr int OUTPUT_BUCKETS = 8;
-constexpr int MAX_HIDDEN     = 1024;
+constexpr int MAX_HIDDEN     = 1024;     // L1
+constexpr int L2             = 16;
+constexpr int L3             = 32;
 
 // Accumulator: first-layer sums for both perspectives (0 = white, 1 = black).
 struct alignas(64) Accumulator {
@@ -28,10 +35,10 @@ void unload();
 bool loaded();
 int  hiddenSize();
 
-// ---- feature indexing (must match tools/nnue_format.py) ----
+// ---- feature indexing (must match nnue_tools/nnue_format.py) ----
 // 4 files x 8 ranks of the (mirrored) king square -> bucket. Index = rank * 4 + file.
-constexpr int KING_BUCKET[32] = {0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 4, 4, 5, 5,
-                                 6, 6, 7, 7, 6, 6, 7, 7, 6, 6, 7, 7, 6, 6, 7, 7};
+constexpr int KING_BUCKET[32] = {0, 1, 2, 3,     4, 5, 6, 7,     8, 8, 9, 9,     8, 8, 9, 9,
+                                 10, 10, 11, 11, 10, 10, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15};
 
 // king key of one perspective: (bucket << 1) | mirror. Changes only when that side's king changes bucket
 // or crosses the d/e file boundary; every such change needs a refresh of that perspective's accumulator.
@@ -62,11 +69,12 @@ inline int outputBucket(int n) {
 void reset(Accumulator& acc);                                   // both perspectives = first-layer bias
 void resetPerspective(Accumulator& acc, int perspective);       // one perspective = first-layer bias
 void copy(Accumulator& dst, const Accumulator& src);            // copies the active part (both perspectives)
+void copyPerspective(Accumulator& dst, const Accumulator& src, int perspective);
 void addFeature(Accumulator& acc, int perspective, int feature);
 void subFeature(Accumulator& acc, int perspective, int feature);
 
-// SIMD (AVX2) paths are used automatically when the CPU supports them; the results are bit-identical to the
-// plain C++ code. setSimd(false) forces the plain code (for tests and comparisons).
+// SIMD (AVX2) paths are chosen at run time when the CPU supports them (no special compiler flag needed); the results
+// are bit-identical to the plain C++ code. setSimd(false) forces the plain code (for tests and comparisons).
 void setSimd(bool on);
 bool simdActive();
 

@@ -9,95 +9,99 @@
 #define NNUE_X86 1
 #endif
 
-// Net file layout, v2 (little endian), written by nnue_tools/nnue_format.py:
-//   char    magic[8] = "CHSNNUE2"
-//   uint32  hidden
-//   int32   QA, QB, SCALE
-//   uint32  kingBuckets (8), outputBuckets (8)
-//   int16   ftWeights[kingBuckets * 768][hidden]   (real weight * QA)
-//   int16   ftBias[hidden]                         (real bias * QA)
-//   int16   outWeights[outputBuckets][2 * hidden]  (real weight * QB; per bucket: first `hidden` = side to
-//                                                   move, then the other side)
-//   int32   outBias[outputBuckets]                 (real bias * QA * QB)
+// Net file layout, v3 (little endian), written by nnue_tools/nnue_format.py:
+//   char    magic[8] = "CHSNNUE3"
+//   uint32  L1 (hidden), int32 QA, int32 QW, int32 SCALE, uint32 kingBuckets, outputBuckets, l2, l3
+//   int16   ftWeights[kingBuckets * 768][L1]     (real weight * QA)
+//   int16   ftBias[L1]                           (real bias * QA)
+//   int16   l2Weights[outputBuckets][l2][L1]     (real weight * QW)
+//   float   l2Bias[outputBuckets][l2]
+//   float   l3Weights[outputBuckets][l3][l2], l3Bias[outputBuckets][l3]
+//   float   outWeights[outputBuckets][l3], outBias[outputBuckets]
 //
-// Inference (all integer), with b = the output bucket:
-//   c = clamp(acc, 0, QA);  sum = sum(c * c * w[b]);  sum /= QA;  sum += outBias[b];
-//   score = sum * SCALE / (QA * QB)          (divisions truncate toward zero)
+// Inference, for output bucket b:
+//   c = clamp(acc, 0, QA);  p = (c[i] * c[i + L1/2] + 128) >> 8      (pairwise per perspective: side to move first, then the other)
+//   z[j] = sum_i p[i] * l2W[b][j][i]            (int32, exact)
+//   h2 = clamp(z / (PSCALE * QW) + l2B, 0, 1),  PSCALE = QA*QA/256       (float from here on)
+//   h3 = clamp(l3W * h2 + l3B, 0, 1);  out = outW . h3 + outB;  score = trunc(out * SCALE)
+// The integer part is exact and identical in the plain and the AVX2 code; the float tail is shared code.
 
 namespace nnue {
 
 namespace {
-constexpr size_t FT_ROWS = (size_t)KING_BUCKETS * NUM_FEATURES;
-
-alignas(64) int16_t g_ftW[FT_ROWS * MAX_HIDDEN];
-alignas(64) int16_t g_ftB[MAX_HIDDEN];
-alignas(64) int16_t g_outW[(size_t)OUTPUT_BUCKETS * 2 * MAX_HIDDEN];
-int32_t g_outB[OUTPUT_BUCKETS];
-int  g_hidden = 0, g_qa = 255, g_qb = 64, g_scale = 400;
+struct Net {
+    int hidden = 0, qa = 255, qw = 512, scale = 400;
+    float s2 = 0.f;                                 // 1 / (PSCALE * QW)
+    std::vector<int16_t> ftW, ftB, l2W;
+    std::vector<float> l2B, l3W, l3B, outW, outB;
+};
+Net g_net;
 bool g_loaded = false;
 bool g_avx2 = false;         // this CPU can run the AVX2 paths (checked once, at load)
 bool g_simdAllowed = true;   // tests can switch the SIMD paths off to compare against the plain C++ code
-bool g_fastEval = false;     // the loaded net satisfies the limits of the madd-based evaluation (see load())
 
 bool fail(std::string* err, const char* msg) { if (err) *err = msg; return false; }
+
+template <class T>
+bool readVec(FILE* f, std::vector<T>& v, size_t n) {
+    v.resize(n);
+    return std::fread(v.data(), sizeof(T), n, f) == n;
+}
 }  // namespace
 
 bool load(const std::string& path, std::string* err) {
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return fail(err, "cannot open net file");
-    char magic[8]; uint32_t hidden = 0, kb = 0, ob = 0; int32_t qa = 0, qb = 0, scale = 0;
-    if (std::fread(magic, 1, 8, f) != 8 || std::fread(&hidden, 4, 1, f) != 1 || std::fread(&qa, 4, 1, f) != 1 ||
-        std::fread(&qb, 4, 1, f) != 1 || std::fread(&scale, 4, 1, f) != 1 || std::fread(&kb, 4, 1, f) != 1 ||
-        std::fread(&ob, 4, 1, f) != 1) {
+    char magic[8];
+    if (std::fread(magic, 1, 8, f) != 8) { std::fclose(f); return fail(err, "bad net header"); }
+    if (std::memcmp(magic, "CHSNNUE1", 8) == 0 || std::memcmp(magic, "CHSNNUE2", 8) == 0) {
+        std::fclose(f);
+        return fail(err, "this is an old (v1/v2) net; the engine needs a v3 net, retrain with the new train.py");
+    }
+    uint32_t hidden = 0, kb = 0, ob = 0, l2 = 0, l3 = 0; int32_t qa = 0, qw = 0, scale = 0;
+    if (std::memcmp(magic, "CHSNNUE3", 8) != 0 || std::fread(&hidden, 4, 1, f) != 1 || std::fread(&qa, 4, 1, f) != 1 ||
+        std::fread(&qw, 4, 1, f) != 1 || std::fread(&scale, 4, 1, f) != 1 || std::fread(&kb, 4, 1, f) != 1 ||
+        std::fread(&ob, 4, 1, f) != 1 || std::fread(&l2, 4, 1, f) != 1 || std::fread(&l3, 4, 1, f) != 1) {
         std::fclose(f);
         return fail(err, "bad net header");
     }
-    if (std::memcmp(magic, "CHSNNUE2", 8) != 0) {
-        std::fclose(f);
-        return fail(err, std::memcmp(magic, "CHSNNUE1", 8) == 0 ? "this is an old (v1) net; the engine needs a v2 net"
-                                                                 : "bad net header");
-    }
-    if (hidden == 0 || hidden > (uint32_t)MAX_HIDDEN || qa <= 0 || qa > 32767 || qb <= 0 || scale <= 0 ||
-        kb != (uint32_t)KING_BUCKETS || ob != (uint32_t)OUTPUT_BUCKETS) {
+    if (hidden == 0 || hidden > (uint32_t)MAX_HIDDEN || (hidden % 32) || qa <= 0 || qa > 255 || qw <= 0 || scale <= 0 ||
+        kb != (uint32_t)KING_BUCKETS || ob != (uint32_t)OUTPUT_BUCKETS || l2 != (uint32_t)L2 || l3 != (uint32_t)L3) {
         std::fclose(f);
         return fail(err, "unsupported net parameters");
     }
-    // read into temporaries first so a bad file never clobbers a working net
-    const size_t nW = FT_ROWS * hidden, nO = (size_t)OUTPUT_BUCKETS * 2 * hidden;
-    std::vector<int16_t> tW(nW), tB(hidden), tO(nO);
-    int32_t tOB[OUTPUT_BUCKETS];
-    bool ok = std::fread(tW.data(), 2, nW, f) == nW && std::fread(tB.data(), 2, hidden, f) == hidden &&
-              std::fread(tO.data(), 2, nO, f) == nO && std::fread(tOB, 4, OUTPUT_BUCKETS, f) == (size_t)OUTPUT_BUCKETS;
+    Net n;                                          // read into a temporary so a bad file never clobbers a working net
+    n.hidden = (int)hidden; n.qa = qa; n.qw = qw; n.scale = scale;
+    n.s2 = (float)(1.0 / ((double)qa * qa / 256.0 * qw));
+    const size_t H = hidden;
+    bool ok = readVec(f, n.ftW, (size_t)KING_BUCKETS * NUM_FEATURES * H) && readVec(f, n.ftB, H) &&
+              readVec(f, n.l2W, (size_t)OUTPUT_BUCKETS * L2 * H) && readVec(f, n.l2B, (size_t)OUTPUT_BUCKETS * L2) &&
+              readVec(f, n.l3W, (size_t)OUTPUT_BUCKETS * L3 * L2) && readVec(f, n.l3B, (size_t)OUTPUT_BUCKETS * L3) &&
+              readVec(f, n.outW, (size_t)OUTPUT_BUCKETS * L3) && readVec(f, n.outB, (size_t)OUTPUT_BUCKETS);
     const bool extra = ok && std::fgetc(f) != EOF;      // trailing bytes: wrong file
     std::fclose(f);
     if (!ok || extra) return fail(err, "net file has the wrong size");
 
-    std::memcpy(g_ftW, tW.data(), nW * 2);
-    std::memcpy(g_ftB, tB.data(), (size_t)hidden * 2);
-    std::memcpy(g_outW, tO.data(), nO * 2);
-    std::memcpy(g_outB, tOB, sizeof(tOB));
-    g_hidden = (int)hidden; g_qa = qa; g_qb = qb; g_scale = scale;
+    // The dense sums must not overflow int32 (then plain and SIMD code are exactly equal). Inputs are <= 254.
+    int maxW = 0;
+    for (int16_t w : n.l2W) maxW = std::max(maxW, std::abs((int)w));
+    if ((int64_t)H * 254 * maxW >= ((int64_t)1 << 31)) return fail(err, "net weights are too large for the integer layer");
+
+    g_net = std::move(n);
 #ifdef NNUE_X86
     __builtin_cpu_init();
     g_avx2 = __builtin_cpu_supports("avx2");
 #endif
-    // The AVX2 evaluation computes (c * w) as int16 and (c * w) * c as int32 lane sums. That is exact (identical to
-    // the plain code) when |w| * QA fits in int16 and the lane sums cannot overflow int32. Check both here, over
-    // the weights of every output bucket.
-    int maxW = 0;
-    for (size_t i = 0; i < nO; ++i) maxW = std::max(maxW, std::abs((int)g_outW[i]));
-    const int64_t perLane = (int64_t)(2 * (int64_t)hidden / 16) * 2 * (int64_t)maxW * qa * qa;   // madd iterations * 2 products
-    g_fastEval = (hidden % 16 == 0) && (int64_t)maxW * qa <= 32767 && perLane < ((int64_t)1 << 31);
     g_loaded = true;
     return true;
 }
 
 void unload()        { g_loaded = false; }
 bool loaded()        { return g_loaded; }
-int  hiddenSize()    { return g_hidden; }
+int  hiddenSize()    { return g_net.hidden; }
 
 void resetPerspective(Accumulator& acc, int perspective) {
-    std::memcpy(acc.v[perspective], g_ftB, (size_t)g_hidden * sizeof(int16_t));
+    std::memcpy(acc.v[perspective], g_net.ftB.data(), (size_t)g_net.hidden * sizeof(int16_t));
 }
 
 void reset(Accumulator& acc) {
@@ -107,7 +111,11 @@ void reset(Accumulator& acc) {
 
 void copy(Accumulator& dst, const Accumulator& src) {
     for (int p = 0; p < 2; ++p)
-        std::memcpy(dst.v[p], src.v[p], (size_t)g_hidden * sizeof(int16_t));
+        std::memcpy(dst.v[p], src.v[p], (size_t)g_net.hidden * sizeof(int16_t));
+}
+
+void copyPerspective(Accumulator& dst, const Accumulator& src, int perspective) {
+    std::memcpy(dst.v[perspective], src.v[perspective], (size_t)g_net.hidden * sizeof(int16_t));
 }
 
 #ifdef NNUE_X86
@@ -124,76 +132,113 @@ __attribute__((target("avx2"))) static void subAVX2(int16_t* a, const int16_t* w
 #endif
 
 void addFeature(Accumulator& acc, int perspective, int feature) {
-    const int16_t* w = g_ftW + (size_t)feature * g_hidden;
+    const int H = g_net.hidden;
+    const int16_t* w = g_net.ftW.data() + (size_t)feature * H;
     int16_t* a = acc.v[perspective];
 #ifdef NNUE_X86
-    if (g_avx2 && g_simdAllowed && g_hidden % 16 == 0) { addAVX2(a, w, g_hidden); return; }
+    if (g_avx2 && g_simdAllowed) { addAVX2(a, w, H); return; }       // H is a multiple of 32 (checked at load)
 #endif
-    for (int i = 0; i < g_hidden; ++i) a[i] = (int16_t)(a[i] + w[i]);
+    for (int i = 0; i < H; ++i) a[i] = (int16_t)(a[i] + w[i]);
 }
 
 void subFeature(Accumulator& acc, int perspective, int feature) {
-    const int16_t* w = g_ftW + (size_t)feature * g_hidden;
+    const int H = g_net.hidden;
+    const int16_t* w = g_net.ftW.data() + (size_t)feature * H;
     int16_t* a = acc.v[perspective];
 #ifdef NNUE_X86
-    if (g_avx2 && g_simdAllowed && g_hidden % 16 == 0) { subAVX2(a, w, g_hidden); return; }
+    if (g_avx2 && g_simdAllowed) { subAVX2(a, w, H); return; }
 #endif
-    for (int i = 0; i < g_hidden; ++i) a[i] = (int16_t)(a[i] - w[i]);
+    for (int i = 0; i < H; ++i) a[i] = (int16_t)(a[i] - w[i]);
 }
-
-#ifdef NNUE_X86
-// sum over i of clamp(a[i], 0, qa)^2 * w[i], computed as madd((c * w) as int16, c): exact when g_fastEval holds.
-__attribute__((target("avx2"))) static __m256i dotSideAVX2(const int16_t* a, const int16_t* w, int n, int qa, __m256i acc) {
-    const __m256i zero = _mm256_setzero_si256();
-    const __m256i vqa  = _mm256_set1_epi16((int16_t)qa);
-    for (int i = 0; i < n; i += 16) {
-        __m256i c  = _mm256_min_epi16(_mm256_max_epi16(_mm256_loadu_si256((const __m256i*)(a + i)), zero), vqa);
-        __m256i cw = _mm256_mullo_epi16(c, _mm256_loadu_si256((const __m256i*)(w + i)));
-        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(cw, c));
-    }
-    return acc;
-}
-
-__attribute__((target("avx2"))) static int64_t sumAVX2(const int16_t* us, const int16_t* them, const int16_t* wUs,
-                                                       const int16_t* wTh, int n, int qa) {
-    __m256i acc = dotSideAVX2(us, wUs, n, qa, _mm256_setzero_si256());
-    acc = dotSideAVX2(them, wTh, n, qa, acc);
-    alignas(32) int32_t lanes[8];
-    _mm256_store_si256((__m256i*)lanes, acc);
-    int64_t t = 0;
-    for (int i = 0; i < 8; ++i) t += lanes[i];
-    return t;
-}
-#endif
 
 void setSimd(bool on) { g_simdAllowed = on; }
 bool simdActive()     { return g_avx2 && g_simdAllowed; }
 
+// ---- evaluation: integer part (pairwise product + first dense layer), plain and AVX2 ----
+static void denseIntPlain(const Accumulator& acc, int stm, int bucket, int32_t z[L2]) {
+    const Net& n = g_net;
+    const int H = n.hidden, half = H / 2, qa = n.qa;
+    int16_t x[MAX_HIDDEN];
+    for (int side = 0; side < 2; ++side) {
+        const int16_t* a = acc.v[side == 0 ? stm : (stm ^ 1)];
+        int16_t* dst = x + side * half;
+        for (int i = 0; i < half; ++i) {
+            const int c0 = std::max(0, std::min((int)a[i], qa));
+            const int c1 = std::max(0, std::min((int)a[i + half], qa));
+            dst[i] = (int16_t)((c0 * c1 + 128) >> 8);
+        }
+    }
+    const int16_t* w2 = n.l2W.data() + (size_t)bucket * L2 * H;
+    for (int j = 0; j < L2; ++j) {
+        const int16_t* wj = w2 + (size_t)j * H;
+        int32_t sum = 0;
+        for (int i = 0; i < H; ++i) sum += (int32_t)x[i] * (int32_t)wj[i];
+        z[j] = sum;
+    }
+}
+
+#ifdef NNUE_X86
+__attribute__((target("avx2"))) static void denseIntAVX2(const Accumulator& acc, int stm, int bucket, int32_t z[L2]) {
+    const Net& n = g_net;
+    const int H = n.hidden, half = H / 2;
+    alignas(32) int16_t x[MAX_HIDDEN];
+    const __m256i zero = _mm256_setzero_si256(), qmax = _mm256_set1_epi16((short)n.qa), rnd = _mm256_set1_epi16(128);
+    for (int side = 0; side < 2; ++side) {
+        const int16_t* a = acc.v[side == 0 ? stm : (stm ^ 1)];
+        int16_t* dst = x + side * half;
+        for (int i = 0; i < half; i += 16) {
+            const __m256i c0 = _mm256_min_epi16(_mm256_max_epi16(_mm256_loadu_si256((const __m256i*)(a + i)), zero), qmax);
+            const __m256i c1 = _mm256_min_epi16(_mm256_max_epi16(_mm256_loadu_si256((const __m256i*)(a + i + half)), zero), qmax);
+            // c0 * c1 <= 255 * 255 and + 128 both fit in 16 bits unsigned; the logical shift gives (c0*c1 + 128) >> 8 exactly
+            _mm256_store_si256((__m256i*)(dst + i), _mm256_srli_epi16(_mm256_add_epi16(_mm256_mullo_epi16(c0, c1), rnd), 8));
+        }
+    }
+    const int16_t* w2 = n.l2W.data() + (size_t)bucket * L2 * H;
+    for (int j = 0; j < L2; ++j) {
+        const int16_t* wj = w2 + (size_t)j * H;
+        __m256i s0 = _mm256_setzero_si256(), s1 = _mm256_setzero_si256();
+        for (int i = 0; i < H; i += 32) {
+            s0 = _mm256_add_epi32(s0, _mm256_madd_epi16(_mm256_loadu_si256((const __m256i*)(x + i)),
+                                                        _mm256_loadu_si256((const __m256i*)(wj + i))));
+            s1 = _mm256_add_epi32(s1, _mm256_madd_epi16(_mm256_loadu_si256((const __m256i*)(x + i + 16)),
+                                                        _mm256_loadu_si256((const __m256i*)(wj + i + 16))));
+        }
+        __m256i t = _mm256_add_epi32(s0, s1);
+        __m128i u = _mm_add_epi32(_mm256_castsi256_si128(t), _mm256_extracti128_si256(t, 1));
+        u = _mm_hadd_epi32(u, u);
+        u = _mm_hadd_epi32(u, u);
+        z[j] = _mm_cvtsi128_si32(u);
+    }
+}
+#endif
+
 int evaluate(const Accumulator& acc, int stm, int bucket) {
     bucket = std::max(0, std::min(bucket, OUTPUT_BUCKETS - 1));
-    const int16_t* us   = acc.v[stm];
-    const int16_t* them = acc.v[stm ^ 1];
-    const int16_t* wUs  = g_outW + (size_t)bucket * 2 * g_hidden;
-    const int16_t* wTh  = wUs + g_hidden;
-    const int qa = g_qa;
+    int32_t z[L2];
 #ifdef NNUE_X86
-    if (g_avx2 && g_simdAllowed && g_fastEval) {
-        int64_t sum = sumAVX2(us, them, wUs, wTh, g_hidden, qa);
-        sum /= qa;
-        sum += g_outB[bucket];
-        return (int)(sum * g_scale / ((int64_t)qa * g_qb));
-    }
+    if (g_avx2 && g_simdAllowed) denseIntAVX2(acc, stm, bucket, z);
+    else
 #endif
-    int64_t sum = 0;
-    for (int i = 0; i < g_hidden; ++i) {
-        const int cu = std::max(0, std::min((int)us[i], qa));
-        const int ct = std::max(0, std::min((int)them[i], qa));
-        sum += (int64_t)((int32_t)(cu * cu) * (int32_t)wUs[i]);
-        sum += (int64_t)((int32_t)(ct * ct) * (int32_t)wTh[i]);
+        denseIntPlain(acc, stm, bucket, z);
+
+    // float tail (shared by both paths, so their results are identical)
+    const Net& n = g_net;
+    float h2[L2];
+    for (int j = 0; j < L2; ++j) {
+        const float v = (float)z[j] * n.s2 + n.l2B[(size_t)bucket * L2 + j];
+        h2[j] = std::max(0.f, std::min(1.f, v));
     }
-    sum /= qa;
-    sum += g_outB[bucket];
-    return (int)(sum * g_scale / ((int64_t)qa * g_qb));
+    const float* w3 = n.l3W.data() + (size_t)bucket * L3 * L2;
+    float h3[L3];
+    for (int k = 0; k < L3; ++k) {
+        float s = n.l3B[(size_t)bucket * L3 + k];
+        for (int j = 0; j < L2; ++j) s += w3[k * L2 + j] * h2[j];
+        h3[k] = std::max(0.f, std::min(1.f, s));
+    }
+    float o = n.outB[bucket];
+    const float* wo = n.outW.data() + (size_t)bucket * L3;
+    for (int k = 0; k < L3; ++k) o += wo[k] * h3[k];
+    return (int)(o * (float)n.scale);                   // truncates toward zero
 }
 
 }  // namespace nnue
