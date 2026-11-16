@@ -14,7 +14,7 @@ positions from the Lichess database. (Self play data will be added in the future
 - UCI protocol; works with cutechess-cli, Arena, Lichess-bot and others
 
 ## Strength
-> +3356.7 ± 17.1 Elo vs. Akimbo 1.0.0 (3474), SmallBrain 7.0 (3441), Tunguska 2.2 (3362), Laser 1.7 (3338), Mr Bob 1.3.0 (3313) [20+0.2, 250 rounds, 2 games, -repeat (2500 total games)]
+> +3368.3 ± 11.7 Elo vs. Akimbo 1.0.0 (3474), SmallBrain 7.0 (3441), Tunguska 2.2 (3362), Laser 1.7 (3338), Mr Bob 1.3.0 (3313) [20+0.2, 250 rounds, 2 games, -repeat (2500 total games)]
 
 ## Download
 Windows x64 builds (AVX2) are on the [Releases](https://github.com/Perfyyyyy/Niikoo/releases) page.
@@ -45,7 +45,7 @@ make bench NET=nets/net.bin
 ## Training the network
 The training pipeline is in [`nnue_tools/`](nnue_tools): `prep_data.py` converts the Lichess evaluation database into
 training shards and `train.py` trains the network (CPU or GPU) and writes the engine's net file.
-See [`docs/TRAINING.md`](docs/TRAINING.md).
+See [`TRAINING`](docs/TRAINING.md).
 
 ## Project layout
 ```
@@ -62,7 +62,7 @@ docs/         design notes, training guide, test results
 - [Lichess evaluation database](https://database.lichess.org/) (training data), CC0
 - Piece-square tables from the Simplified Evaluation Function (Chess Programming Wiki)
 
-See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+See [`THIRD_PARTY_NOTICES`](THIRD_PARTY_NOTICES.md).
 
 ## License
-MIT (see `LICENSE`).
+MIT See [`LICENSE`](LICENSE.md).

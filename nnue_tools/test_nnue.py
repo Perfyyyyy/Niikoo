@@ -10,7 +10,7 @@ exe = os.path.join(here, "nnue_test.exe" if os.name == "nt" else "nnue_test")
 if not os.path.exists(exe):
     sys.exit("nnue_test is missing - compile it first (see the g++ command in the README)")
 rng = np.random.default_rng(1)
-for L1, wscale in ((32, 1.0), (256, 1.0), (256, 0.2), (1024, 0.5)):
+for L1, wscale in ((64, 1.0), (256, 1.0), (256, 0.2), (1024, 0.5)):
     ft_w = rng.integers(-40, 41, size=(KING_BUCKETS * 768, L1), dtype=np.int16)
     ft_b = rng.integers(-30, 120, size=L1, dtype=np.int16)
     l2_w = rng.integers(-300, 301, size=(OUTPUT_BUCKETS, L2, L1), dtype=np.int16)
