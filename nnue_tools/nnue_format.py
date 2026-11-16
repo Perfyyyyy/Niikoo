@@ -22,7 +22,7 @@ def write_net(path, ft_w, ft_b, l2_w, l2_b, l3_w, l3_b, out_w, out_b):
     """ft_w int16 [16*768, L1], ft_b int16 [L1], l2_w int16 [8, 16, L1], l2_b f32 [8,16],
        l3_w f32 [8, 32, 16], l3_b f32 [8, 32], out_w f32 [8, 32], out_b f32 [8]."""
     L1 = ft_w.shape[1]
-    assert L1 % 2 == 0 and ft_w.shape[0] == KING_BUCKETS * 768 and ft_b.shape == (L1,)
+    assert L1 % 64 == 0 and ft_w.shape[0] == KING_BUCKETS * 768 and ft_b.shape == (L1,)
     arrs = [(ft_w, "<i2", (KING_BUCKETS * 768, L1)), (ft_b, "<i2", (L1,)),
             (l2_w, "<i2", (OUTPUT_BUCKETS, L2, L1)), (l2_b, "<f4", (OUTPUT_BUCKETS, L2)),
             (l3_w, "<f4", (OUTPUT_BUCKETS, L3, L2)), (l3_b, "<f4", (OUTPUT_BUCKETS, L3)),
@@ -74,6 +74,14 @@ def feature_index(perspective, key, colour, pt, sq):
 def output_bucket(n):
     return max(0, min((n - 2) // 4, OUTPUT_BUCKETS - 1))
 
+def requant_l2(l2_w_b):
+    """int16 [L2, L1] for one bucket -> (int8-valued weights, per-row scale s), exactly as nnue.cpp load() does it."""
+    w = l2_w_b.astype(np.int64)
+    rowmax = np.abs(w).max(axis=1)
+    s = np.where(rowmax <= 64, 1.0, 64.0 / np.maximum(rowmax, 1))
+    x = w * s[:, None]
+    w8 = np.clip(np.sign(x) * np.floor(np.abs(x) + 0.5), -64, 64).astype(np.int64)
+    return w8, s
 
 def reference_eval(net, pieces, stm):
     """pieces: list of (colour, pt, sq). Integer arithmetic up to and including the first dense layer (bit-exact with
@@ -94,8 +102,9 @@ def reference_eval(net, pieces, stm):
         parts.append((c[:half] * c[half:] + 128) >> 8)               # pairwise product, 0..254
     x = np.concatenate(parts)
     b = output_bucket(len(pieces))
-    z = net["l2_w"][b].astype(np.int64) @ x                          # int32 in the engine
-    h2 = np.clip(z / (PSCALE * qw) + net["l2_b"][b].astype(np.float64), 0.0, 1.0)
+    w8, s = requant_l2(net["l2_w"][b])                               # int8 rows, as the engine holds them
+    z = w8 @ x                                                       # int32 in the engine
+    h2 = np.clip(z / (PSCALE * qw * s) + net["l2_b"][b].astype(np.float64), 0.0, 1.0)
     h3 = np.clip(net["l3_w"][b].astype(np.float64) @ h2 + net["l3_b"][b], 0.0, 1.0)
     o = float(net["out_w"][b].astype(np.float64) @ h3 + net["out_b"][b])
     return int(o * scale)                                            # truncates toward zero
