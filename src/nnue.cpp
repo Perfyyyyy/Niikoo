@@ -7,7 +7,12 @@
 #include <vector>
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
+#include <cpuid.h>
 #define NNUE_X86 1
+// AVX-VNNI (VEX-encoded vpdpbusd) intrinsics need GCC >= 11 or clang >= 12; older compilers just skip that path.
+#if (defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 11) || (defined(__clang__) && __clang_major__ >= 12)
+#define NNUE_AVXVNNI 1
+#endif
 #endif
 
 // Net file layout, v3 (little endian), written by nnue_tools/nnue_format.py:
@@ -31,6 +36,10 @@
 //    max|w| <= 64 (rows that already fit are kept exactly) and rounded; the per-row factor goes into s2[bucket][j].
 //    |w| <= 64 and inputs <= 254 guarantee that the int16 pair sums of maddubs never saturate, so the integer sums
 //    are exact for the int8 weights, and the plain and AVX2 code agree bit for bit.
+//  * the dense layer has VNNI paths: vpdpbusd does u8 x s8 -> int32 accumulate in one instruction (replacing
+//    maddubs + madd + add). AVX-VNNI is preferred, AVX512-VNNI (256-bit, needs AVX512VL) is the fallback, otherwise the AVX2
+//    path runs. All three add the same exact int32 products, so the integer sums are identical.
+//  * prefetchFeature() pulls a first-layer weight row (~1.5 KB at L1 = 768) towards the cache ahead of the update.
 //  * l3 weights are stored transposed ([bucket][l2][l3]) so the AVX2 tail is 16 broadcast multiply-adds over l3 lanes.
 //    The output dot product has a fixed summation order (8 lane partial sums, then a fixed tree) that the plain code
 //    reproduces exactly; no FMA is used, so plain and AVX2 float tails give identical results.
@@ -50,6 +59,8 @@ bool g_loaded = false;
 uint32_t g_netId = 0;        // bumped on every load / unload
 bool g_avx2 = false;         // this CPU can run the AVX2 paths (checked once, at load)
 bool g_simdAllowed = true;   // tests can switch the SIMD paths off to compare against the plain C++ code
+int  g_vnni = 0;             // 0 none, 1 AVX-VNNI, 2 AVX512-VNNI (+VL); set at load
+bool g_vnniAllowed = true;   // tests can switch VNNI off to compare against the AVX2 path
 
 bool fail(std::string* err, const char* msg) { if (err) *err = msg; return false; }
 
@@ -119,6 +130,14 @@ bool load(const std::string& path, std::string* err) {
 #ifdef NNUE_X86
     __builtin_cpu_init();
     g_avx2 = __builtin_cpu_supports("avx2");
+    g_vnni = 0;
+    if (g_avx2) {
+#ifdef NNUE_AVXVNNI
+        unsigned a = 0, b = 0, c = 0, d = 0;            // CPUID.(EAX=7,ECX=1):EAX bit 4 = AVX-VNNI (YMM state is covered by the avx2 check)
+        if (__get_cpuid_count(7, 1, &a, &b, &c, &d) && (a & (1u << 4))) g_vnni = 1;
+#endif
+        if (g_vnni == 0 && __builtin_cpu_supports("avx512vnni") && __builtin_cpu_supports("avx512vl")) g_vnni = 2;
+    }
 #endif
     g_loaded = true;
     return true;
@@ -227,6 +246,22 @@ void updatePerspective(int16_t* dst, const int16_t* src, const int* subs, int ns
 void setSimd(bool on) { g_simdAllowed = on; }
 bool simdActive()     { return g_avx2 && g_simdAllowed; }
 
+void prefetchFeature(int feature) {
+    if (!g_loaded) return;
+    const char* p = (const char*)featureRow(feature);
+    const char* end = p + (size_t)g_net.hidden * sizeof(int16_t);
+    for (; p < end; p += 64) __builtin_prefetch(p, 0, 3);   // one hint per cache line of the row
+    __builtin_prefetch(end - 1, 0, 3);                      // last line, in case the row is not 64-byte aligned
+}
+
+void setVnni(bool on) { g_vnniAllowed = on; }
+const char* simdName() {
+    if (!(g_avx2 && g_simdAllowed)) return "plain";
+    if (g_vnniAllowed && g_vnni == 1) return "avx-vnni";
+    if (g_vnniAllowed && g_vnni == 2) return "avx512-vnni";
+    return "avx2";
+}
+
 // ---- evaluation ----
 static_assert(L2 % 4 == 0 && L3 % 8 == 0, "AVX2 tail assumes L2 % 4 == 0 and L3 % 8 == 0");
 
@@ -279,12 +314,10 @@ static float tailPlain(const int32_t z[L2], int bucket) {
 }
 
 #ifdef NNUE_X86
-// Integer part, AVX2: pairwise product packed to u8, then maddubs(x_u8, w_s8) -> int16 pair sums -> madd(.,1) -> int32.
-// Four output rows are processed together so every x load is used four times.
-__attribute__((target("avx2"))) static void denseIntAVX2(const Accumulator& acc, int stm, int bucket, int32_t z[L2]) {
+// Pairwise product packed to u8 (shared by the AVX2 and VNNI dense paths). x must be 32-byte aligned.
+__attribute__((always_inline, target("avx2"))) static inline void packPairwiseAVX2(const Accumulator& acc, int stm, uint8_t* x) {
     const Net& n = g_net;
     const int H = n.hidden, half = H / 2;
-    alignas(32) uint8_t x[MAX_HIDDEN];
     const __m256i zero = _mm256_setzero_si256(), qmax = _mm256_set1_epi16((short)n.qa), rnd = _mm256_set1_epi16(128);
     for (int side = 0; side < 2; ++side) {
         const int16_t* a = acc.v[side == 0 ? stm : (stm ^ 1)];
@@ -301,7 +334,16 @@ __attribute__((target("avx2"))) static void denseIntAVX2(const Accumulator& acc,
             _mm256_store_si256((__m256i*)(dst + i), _mm256_permute4x64_epi64(_mm256_packus_epi16(p[0], p[1]), 0xD8));
         }
     }
-    const __m256i ones = _mm256_set1_epi16(1);
+}
+
+// Integer part, AVX2: maddubs(x_u8, w_s8) -> int16 pair sums -> madd(.,1) -> int32.
+// Four output rows are processed together so every x load is used four times.
+__attribute__((target("avx2"))) static void denseIntAVX2(const Accumulator& acc, int stm, int bucket, int32_t z[L2]) {
+    const Net& n = g_net;
+    const int H = n.hidden;
+    alignas(32) uint8_t x[MAX_HIDDEN];
+    packPairwiseAVX2(acc, stm, x);
+    const __m256i zero = _mm256_setzero_si256(), ones = _mm256_set1_epi16(1);
     const int8_t* w2 = n.l2W8.data() + (size_t)bucket * L2 * H;
     for (int j = 0; j < L2; j += 4) {
         const int8_t* w0 = w2 + (size_t)j * H;
@@ -319,6 +361,40 @@ __attribute__((target("avx2"))) static void denseIntAVX2(const Accumulator& acc,
         _mm_storeu_si128((__m128i*)(z + j), _mm_add_epi32(_mm256_castsi256_si128(h), _mm256_extracti128_si256(h, 1)));
     }
 }
+
+// Integer part, VNNI: one vpdpbusd per 32 inputs and row (u8 x s8, four products summed straight into int32 lanes).
+// DPBUSD(acc, u8, s8) is the intrinsic of the respective instruction set. No int16 intermediate, so no saturation question at all.
+#define NNUE_DENSE_VNNI_BODY(DPBUSD)                                                                                    \
+    const Net& n = g_net;                                                                                               \
+    const int H = n.hidden;                                                                                             \
+    alignas(32) uint8_t x[MAX_HIDDEN];                                                                                  \
+    packPairwiseAVX2(acc, stm, x);                                                                                      \
+    const __m256i zero = _mm256_setzero_si256();                                                                        \
+    const int8_t* w2 = n.l2W8.data() + (size_t)bucket * L2 * H;                                                         \
+    for (int j = 0; j < L2; j += 4) {                                                                                   \
+        const int8_t* w0 = w2 + (size_t)j * H;                                                                          \
+        __m256i s0 = zero, s1 = zero, s2 = zero, s3 = zero;                                                             \
+        for (int i = 0; i < H; i += 32) {                                                                               \
+            const __m256i xv = _mm256_load_si256((const __m256i*)(x + i));                                              \
+            s0 = DPBUSD(s0, xv, _mm256_loadu_si256((const __m256i*)(w0 + i)));                                          \
+            s1 = DPBUSD(s1, xv, _mm256_loadu_si256((const __m256i*)(w0 + H + i)));                                      \
+            s2 = DPBUSD(s2, xv, _mm256_loadu_si256((const __m256i*)(w0 + 2 * H + i)));                                  \
+            s3 = DPBUSD(s3, xv, _mm256_loadu_si256((const __m256i*)(w0 + 3 * H + i)));                                  \
+        }                                                                                                               \
+        const __m256i h01 = _mm256_hadd_epi32(s0, s1), h23 = _mm256_hadd_epi32(s2, s3);                                 \
+        const __m256i h   = _mm256_hadd_epi32(h01, h23);                                                                \
+        _mm_storeu_si128((__m128i*)(z + j), _mm_add_epi32(_mm256_castsi256_si128(h), _mm256_extracti128_si256(h, 1)));  \
+    }
+
+#ifdef NNUE_AVXVNNI
+__attribute__((target("avx2,avxvnni"))) static void denseIntAVXVNNI(const Accumulator& acc, int stm, int bucket, int32_t z[L2]) {
+    NNUE_DENSE_VNNI_BODY(_mm256_dpbusd_avx_epi32)
+}
+#endif
+__attribute__((target("avx2,avx512f,avx512vl,avx512vnni"))) static void denseIntAVX512VNNI(const Accumulator& acc, int stm, int bucket, int32_t z[L2]) {
+    NNUE_DENSE_VNNI_BODY(_mm256_dpbusd_epi32)
+}
+#undef NNUE_DENSE_VNNI_BODY
 
 // Float tail, AVX2 (mul + add, never FMA, so the results equal tailPlain exactly).
 __attribute__((target("avx2"))) static float tailAVX2(const int32_t z[L2], int bucket) {
@@ -358,7 +434,11 @@ int evaluate(const Accumulator& acc, int stm, int bucket) {
     float o;
 #ifdef NNUE_X86
     if (g_avx2 && g_simdAllowed) {
-        denseIntAVX2(acc, stm, bucket, z);
+#ifdef NNUE_AVXVNNI
+        if (g_vnniAllowed && g_vnni == 1) denseIntAVXVNNI(acc, stm, bucket, z); else
+#endif
+        if (g_vnniAllowed && g_vnni == 2) denseIntAVX512VNNI(acc, stm, bucket, z);
+        else denseIntAVX2(acc, stm, bucket, z);
         o = tailAVX2(z, bucket);
     } else
 #endif
