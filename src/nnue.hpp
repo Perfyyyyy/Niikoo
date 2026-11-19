@@ -83,10 +83,20 @@ void subFeatureRaw(int16_t* a, int feature);
 // Bit-identical to copying src and then calling subFeatureRaw / addFeatureRaw for each feature.
 void updatePerspective(int16_t* dst, const int16_t* src, const int* subs, int ns, const int* adds, int na);
 
+// Hints the CPU to load first-layer weight row `feature` (hiddenSize() * 2 bytes) into the cache. Call it as soon as a
+// move's feature indices are known (e.g. in makeMove), long before updatePerspective / addFeature / subFeature read them.
+// Pure hint: never changes any result. No-op while no net is loaded.
+void prefetchFeature(int feature);
+
 // SIMD (AVX2) paths are chosen at run time when the CPU supports them (no special compiler flag needed); the results
 // are bit-identical to the plain C++ code. setSimd(false) forces the plain code (for tests and comparisons).
 void setSimd(bool on);
 bool simdActive();
+// On top of AVX2, the dense layer uses AVX-VNNI or AVX512-VNNI (+VL) when the CPU has it (chosen at load, no compiler flag
+// needed). Same exact integer results. setVnni(false) forces the AVX2 dense path (for tests and comparisons);
+// simdName() returns "plain", "avx2", "avx-vnni" or "avx512-vnni" for what evaluate() currently runs.
+void setVnni(bool on);
+const char* simdName();
 
 // Score in centipawns from the point of view of the side to move (stm: 0 white, 1 black).
 // bucket = outputBucket(number of pieces on the board).

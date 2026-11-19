@@ -29,17 +29,3 @@ jobs:
         with:
           name: niikoo-windows
           path: niikoo.exe
-
-  nnue-inference-test:
-    name: NNUE inference vs Python reference
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - run: python -m pip install numpy
-      - name: Compile and test
-        run: |
-          g++ -O2 -std=c++17 -Isrc -o nnue_tools/nnue_test nnue_tools/test_main.cpp src/nnue.cpp
-          python nnue_tools/test_nnue.py

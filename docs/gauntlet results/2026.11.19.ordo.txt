@@ -1,0 +1,12 @@
+
+   # PLAYER          : RATING  ERROR   POINTS  PLAYED    (%)
+   1 Akimbo          : 3474.0   ----    375.5     500   75.1%
+   2 SmallBrain      : 3441.0   ----    274.5     500   54.9%
+   3 Niikoo          : 3388.4   10.8   1259.0    2500   50.4%
+   4 Tunguska 2.2    : 3362.0   ----    231.5     500   46.3%
+   5 Lazer           : 3338.0   ----    170.5     500   34.1%
+   6 Bob             : 3313.0   ----    189.0     500   37.8%
+
+White advantage = 33.05 +/- 5.73
+Draw rate (equal opponents) = 34.53 % +/- 0.99
+
