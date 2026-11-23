@@ -4,7 +4,7 @@
 #include <cstddef>
 
 #ifndef EVALFILE
-#define EVALFILE "net.nnue"
+#define EVALFILE "released_nets/netv4.bin"
 #endif
 
 INCBIN(Net, EVALFILE);               // gNetData (bytes), gNetEnd, gNetSize
