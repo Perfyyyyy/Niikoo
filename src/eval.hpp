@@ -3,13 +3,17 @@
 #include "chess.hpp"
 #include "nnue.hpp"
 
-int evaluate(const chess::Board& b);   // score from White's point of view (net if one is loaded, else handcrafted)
-int evalSide(const chess::Board& b);   // score from the side to move's point of view
+int evaluate(const chess::Board& b);   // score from White's point of view (net only, needs a net loaded)
+int evalSide(const chess::Board& b);   // score from the side to move's point of view (same)
 
 // NNUE: load a net file written by nnue_tools/train.py. Returns false (and fills *err) on failure, in which
-// case the previous eval stays active. Never call while a search is running.
+// case the previous net stays active. Never call while a search is running.
 bool loadNNUE(const std::string& path, std::string* err = nullptr);
-void unloadNNUE();                     // back to the handcrafted eval
+
+// Loads the net that was compiled into the binary (embedded_net.cpp). Call once at startup.
+bool loadEmbeddedNNUE(std::string* err = nullptr);
+
+void unloadNNUE();                     // drops the net; search() refuses to run until one is loaded again
 bool nnueLoaded();
 
 // Builds the NNUE accumulator for a position from scratch (used at the search root and for verification).

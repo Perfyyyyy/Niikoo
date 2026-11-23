@@ -12,6 +12,7 @@
 //   * kingBucket (0..15) comes from the (mirrored) king square, see KING_BUCKET below.
 // The net is loaded from a file written by nnue_tools/train.py (format: see nnue.cpp).
 #include <cstdint>
+#include <cstddef>
 #include <string>
 
 namespace nnue {
@@ -31,6 +32,10 @@ struct alignas(64) Accumulator {
 // Loads a net file. Returns false (and fills *err) if the file is missing or malformed;
 // the previously loaded net, if any, is kept in that case.
 bool load(const std::string& path, std::string* err = nullptr);
+
+// Same parser, but reads the net from memory (used for the net baked into the binary).
+bool loadFromMemory(const void* data, size_t size, std::string* err = nullptr);
+
 void unload();
 bool loaded();
 int  hiddenSize();

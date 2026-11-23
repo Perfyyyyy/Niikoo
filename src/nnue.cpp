@@ -64,46 +64,51 @@ bool g_vnniAllowed = true;   // tests can switch VNNI off to compare against the
 
 bool fail(std::string* err, const char* msg) { if (err) *err = msg; return false; }
 
+// reads straight from a memory block (a file that was loaded into memory, or the net baked into the binary)
+struct Cursor {
+    const uint8_t* p;
+    size_t left;
+    bool read(void* dst, size_t bytes) {
+        if (bytes > left) return false;
+        std::memcpy(dst, p, bytes);
+        p += bytes;
+        left -= bytes;
+        return true;
+    }
+};
+
 template <class T>
-bool readVec(FILE* f, std::vector<T>& v, size_t n) {
+bool readVec(Cursor& c, std::vector<T>& v, size_t n) {
+    if (n > c.left / sizeof(T)) return false;       // also keeps a bogus header from asking for a huge allocation
     v.resize(n);
-    return std::fread(v.data(), sizeof(T), n, f) == n;
+    return c.read(v.data(), n * sizeof(T));
 }
 }  // namespace
 
-bool load(const std::string& path, std::string* err) {
-    FILE* f = std::fopen(path.c_str(), "rb");
-    if (!f) return fail(err, "cannot open net file");
+// the one and only parser, load() and the embedded net both go through here
+bool loadFromMemory(const void* data, size_t size, std::string* err) {
+    Cursor c{(const uint8_t*)data, size};
     char magic[8];
-    if (std::fread(magic, 1, 8, f) != 8) { std::fclose(f); return fail(err, "bad net header"); }
-    if (std::memcmp(magic, "CHSNNUE1", 8) == 0 || std::memcmp(magic, "CHSNNUE2", 8) == 0) {
-        std::fclose(f);
+    if (!c.read(magic, 8)) return fail(err, "bad net header");
+    if (std::memcmp(magic, "CHSNNUE1", 8) == 0 || std::memcmp(magic, "CHSNNUE2", 8) == 0)
         return fail(err, "this is an old (v1/v2) net; the engine needs a v3 net, retrain with the new train.py");
-    }
     uint32_t hidden = 0, kb = 0, ob = 0, l2 = 0, l3 = 0; int32_t qa = 0, qw = 0, scale = 0;
-    if (std::memcmp(magic, "CHSNNUE3", 8) != 0 || std::fread(&hidden, 4, 1, f) != 1 || std::fread(&qa, 4, 1, f) != 1 ||
-        std::fread(&qw, 4, 1, f) != 1 || std::fread(&scale, 4, 1, f) != 1 || std::fread(&kb, 4, 1, f) != 1 ||
-        std::fread(&ob, 4, 1, f) != 1 || std::fread(&l2, 4, 1, f) != 1 || std::fread(&l3, 4, 1, f) != 1) {
-        std::fclose(f);
+    if (std::memcmp(magic, "CHSNNUE3", 8) != 0 || !c.read(&hidden, 4) || !c.read(&qa, 4) || !c.read(&qw, 4) ||
+        !c.read(&scale, 4) || !c.read(&kb, 4) || !c.read(&ob, 4) || !c.read(&l2, 4) || !c.read(&l3, 4))
         return fail(err, "bad net header");
-    }
     if (hidden == 0 || hidden > (uint32_t)MAX_HIDDEN || (hidden % 64) || qa <= 0 || qa > 255 || qw <= 0 || scale <= 0 ||
-        kb != (uint32_t)KING_BUCKETS || ob != (uint32_t)OUTPUT_BUCKETS || l2 != (uint32_t)L2 || l3 != (uint32_t)L3) {
-        std::fclose(f);
+        kb != (uint32_t)KING_BUCKETS || ob != (uint32_t)OUTPUT_BUCKETS || l2 != (uint32_t)L2 || l3 != (uint32_t)L3)
         return fail(err, "unsupported net parameters");
-    }
     Net n;                                          // read into a temporary so a bad file never clobbers a working net
     n.hidden = (int)hidden; n.qa = qa; n.qw = qw; n.scale = scale;
     const size_t H = hidden;
     std::vector<int16_t> l2W16;
     std::vector<float> l3W;
-    bool ok = readVec(f, n.ftW, (size_t)KING_BUCKETS * NUM_FEATURES * H) && readVec(f, n.ftB, H) &&
-              readVec(f, l2W16, (size_t)OUTPUT_BUCKETS * L2 * H) && readVec(f, n.l2B, (size_t)OUTPUT_BUCKETS * L2) &&
-              readVec(f, l3W, (size_t)OUTPUT_BUCKETS * L3 * L2) && readVec(f, n.l3B, (size_t)OUTPUT_BUCKETS * L3) &&
-              readVec(f, n.outW, (size_t)OUTPUT_BUCKETS * L3) && readVec(f, n.outB, (size_t)OUTPUT_BUCKETS);
-    const bool extra = ok && std::fgetc(f) != EOF;      // trailing bytes: wrong file
-    std::fclose(f);
-    if (!ok || extra) return fail(err, "net file has the wrong size");
+    bool ok = readVec(c, n.ftW, (size_t)KING_BUCKETS * NUM_FEATURES * H) && readVec(c, n.ftB, H) &&
+              readVec(c, l2W16, (size_t)OUTPUT_BUCKETS * L2 * H) && readVec(c, n.l2B, (size_t)OUTPUT_BUCKETS * L2) &&
+              readVec(c, l3W, (size_t)OUTPUT_BUCKETS * L3 * L2) && readVec(c, n.l3B, (size_t)OUTPUT_BUCKETS * L3) &&
+              readVec(c, n.outW, (size_t)OUTPUT_BUCKETS * L3) && readVec(c, n.outB, (size_t)OUTPUT_BUCKETS);
+    if (!ok || c.left != 0) return fail(err, "net file has the wrong size");   // too short, or trailing bytes (wrong file)
 
     // int8 requantisation of the first dense layer, per row. |w8| <= 64 keeps maddubs (u8 <= 254 times s8, two summed
     // into int16) below 2 * 254 * 64 = 32512 < 32767, and the int32 row sums far below 2^31.
@@ -141,6 +146,22 @@ bool load(const std::string& path, std::string* err) {
 #endif
     g_loaded = true;
     return true;
+}
+
+bool load(const std::string& path, std::string* err) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return fail(err, "cannot open net file");
+    std::vector<uint8_t> buf;
+    bool ok = std::fseek(f, 0, SEEK_END) == 0;
+    const long size = ok ? std::ftell(f) : -1;
+    ok = ok && size >= 0 && std::fseek(f, 0, SEEK_SET) == 0;
+    if (ok) {
+        buf.resize((size_t)size);
+        ok = std::fread(buf.data(), 1, buf.size(), f) == buf.size();
+    }
+    std::fclose(f);
+    if (!ok) return fail(err, "cannot read net file");
+    return loadFromMemory(buf.data(), buf.size(), err);
 }
 
 void unload()        { g_loaded = false; ++g_netId; }

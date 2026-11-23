@@ -10,8 +10,11 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 using namespace chess;
+
+void setGameHistory(const std::vector<uint64_t>& keys);   // search.cpp (move this to search.hpp)
 
 static const char* BENCH_FENS[] = {
     "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
@@ -103,6 +106,11 @@ void uciLoop() {
     std::thread worker;
     int moveOverhead = 50;                 // ms kept in reserve for GUI / network lag
 
+    {   // net is baked into the binary. no net = search() refuses to run
+        std::string err;
+        if (!loadEmbeddedNNUE(&err)) std::cerr << "Warning: no embedded net: " << err << std::endl;
+    }
+
     auto finishSearch = [&]() {
         requestStop();
         if (worker.joinable()) worker.join();
@@ -147,9 +155,13 @@ void uciLoop() {
             } else if (name == "EvalFile") {
                 finishSearch();                          // never swap the eval under a running search
                 if (value.empty() || value == "<empty>") {
-                    unloadNNUE();
-                    clearTT();
-                    std::cout << "info string NNUE off, using the handcrafted eval" << std::endl;
+                    std::string err;                     // back to the embedded net
+                    if (loadEmbeddedNNUE(&err)) {
+                        clearTT();
+                        std::cout << "info string NNUE: using the embedded net" << std::endl;
+                    } else {
+                        std::cout << "info string ERROR: could not load the embedded net: " << err << std::endl;
+                    }
                 } else {
                     std::string err;
                     if (loadNNUE(value, &err)) {
@@ -184,10 +196,15 @@ void uciLoop() {
                 while (ss >> t && t != "moves") fen += (fen.empty() ? "" : " ") + t;
                 board = Board(fen);
             }
+            std::vector<uint64_t> history;       // positions before the root, for the repetition check
             if (t == "moves") {
                 std::string mv;
-                while (ss >> mv) board.makeMove(uci::uciToMove(board, mv));
+                while (ss >> mv) {
+                    history.push_back(board.hash());
+                    board.makeMove(uci::uciToMove(board, mv));
+                }
             }
+            setGameHistory(history);
         } else if (cmd == "go") {
             finishSearch();
             int wtime = -1, btime = -1, winc = 0, binc = 0, movetime = -1, movestogo = -1, depth = 64;
