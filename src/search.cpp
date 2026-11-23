@@ -60,6 +60,8 @@ static const int RFP_MAX_DEPTH = 6, RFP_MARGIN = 80;                    // rfp
 static const int FP_MAX_DEPTH  = 4, FP_BASE = 120, FP_MARGIN = 100;     // fp
 static const int LMP_MAX_DEPTH = 4;                                     // lmp
 static const int IIR_MIN_DEPTH = 4;                                     // iir
+static const int IIR_CUT_MIN_DEPTH = 6;
+static const int IIR_PV_EXACT_SLACK = 3;
 static const int SE_MIN_DEPTH = 7, SE_MARGIN = 2;                       // singular, margin = SE_MARGIN * depth
 static const int RAZOR_MAX_DEPTH = 3, RAZOR_BASE = 200, RAZOR_MARGIN = 150;   // razoring
 static const int PROBCUT_MIN_DEPTH = 5, PROBCUT_MARGIN = 160, PROBCUT_REDUCTION = 4;
@@ -73,6 +75,15 @@ static const int LMR_EVAL_LOW_MARGIN  = 150;   // non-pv, eval way below alpha -
 static const int LMR_EVAL_HIGH_MARGIN = 200;   // cut node, eval way above beta -> reduce more
 static const int LMR_STRONG_IMPROVE   = 80;    // eval jumped vs 2 plies ago -> reduce less
 static const int LMR_TT_LOWER         = 1;     // non-pv, tt says fail high -> reduce more
+// late good captures get reduced too (0 = off), reductions capped at LMR_GOOD_CAP_MAX
+static const int LMR_GOOD_CAPS = 1, LMR_GOOD_CAP_MAX = 2;
+// non-pv tt fail high: history bonus for a quiet tt move, penalty for the quiet move into the node (0 = off)
+static const int TT_CUT_HIST_DIV = 2, TT_CUT_HIST_MAX_DEPTH = 8;
+// eval jump vs the parent's eval -> cont hist bonus / malus for the quiet move that led here (MUL 0 = off)
+static const int EVAL_HIST_MIL = 6, EVAL_HIST_MAX = 800;
+// hindsight depth : parent reduced by >= INC_RED and eval did not confirm it -> depth +1,
+// parent reduced by >= DEC_RED and eval confirms it by > HINDSIGHT_MARGIN -> depth -1 (INC_RED 0 = off)
+static const int HINDSIGHT_INC_RED = 3, HINDSIGHT_DEC_RED = 2, HINDSIGHT_MARGIN = 150, HINDSIGHT_WORSENING = 2;
 // root lmr (0 = off) + root hist
 static const int ROOT_LMR_MIN_DEPTH = 5, ROOT_LMR_MIN_MOVES = 4;
 static const int ROOT_HIST_UPDATE = 1;
@@ -328,10 +339,6 @@ struct ThreadData {
     // capture hist [side][pt][to][victim]
     int      capHist[2][6][64][6];
     Move     counterMove[6][64];                  // [prev pt][prev to] -> refuting quiet
-    int16_t  corrHist[2][CORR_SIZE];              // corr hist [stm][pawn hash]
-    int16_t  corrMinor[2][CORR_SIZE];             // by minors
-    int16_t  corrNonPawn[2][2][CORR_SIZE];        // [colour][stm], that colour's N/B/R/Q
-    int16_t  corrCont[2][CORR_CONT_SIZE];         // [stm][last move]
     bool     stkQuiet[MAX_PLY + 2];               // move into this ply was quiet
     int      cutoffCnt[MAX_PLY + 4];              // beta cutoffs per ply, reset 2 plies up
     int      lowPlyHist[LOWPLY][64 * 64];         // [ply][from*64 + to], low plies only
@@ -342,6 +349,7 @@ struct ThreadData {
     uint8_t  extCount[MAX_PLY + 2];               // double exts on the line
     // move into each ply (stkTo < 0 = none)
     int      stkPt[MAX_PLY + 2], stkTo[MAX_PLY + 2];
+    int      stkRed[MAX_PLY + 2];                 // lmr reduction of the move into this ply, read once at node entry
     int      evalStack[MAX_PLY + 2];              // static eval per ply
     // nnue: acc per ply, lazy. delta[p] = move into ply p, accValid[p] = acc[p] has it applied
     struct FeatureRef { int8_t colour, pt, sq; };
@@ -373,13 +381,10 @@ struct ThreadData {
         std::memset(stkPt, 0, sizeof(stkPt));
         for (int& t : stkTo) t = -1;
         std::memset(evalStack, 0, sizeof(evalStack));
-        std::memset(corrHist, 0, sizeof(corrHist));
-        std::memset(corrMinor, 0, sizeof(corrMinor));
-        std::memset(corrNonPawn, 0, sizeof(corrNonPawn));
-        std::memset(corrCont, 0, sizeof(corrCont));
         std::memset(pawnHist, 0, sizeof(pawnHist));
         std::memset(posKey, 0, sizeof(posKey));
         std::memset(stkQuiet, 0, sizeof(stkQuiet));
+        std::memset(stkRed, 0, sizeof(stkRed));
         nmpMinPly = 0;
         std::memset(extCount, 0, sizeof(extCount));
         nodes = 0;
@@ -392,6 +397,16 @@ struct ThreadData {
 };
 
 static std::vector<std::unique_ptr<ThreadData>> g_threads;
+struct CorrTables {
+    int16_t pawn[2][CORR_SIZE];
+    int16_t minor[2][CORR_SIZE];
+    int16_t nonPawn[2][2][CORR_SIZE];
+    int16_t cont[2][CORR_CONT_SIZE];
+    void clear() { std::memset(this, 0, sizeof(*this)); }
+};
+static CorrTables g_corr;
+static inline int corrLoad(const int16_t& e) { return __atomic_load_n(&e, __ATOMIC_RELAXED); }
+static inline void corrStore(int16_t& e, int v) { __atomic_store_n(&e, (int16_t)v, __ATOMIC_RELAXED); }
 
 // ---- nnue acc ----
 // call BEFORE makeMove. ply = ply after the move. nothing computed until evalAt
@@ -1002,9 +1017,25 @@ static int quiesce(ThreadData& td, Board& b, int alpha, int beta, int ply, bool 
         ttMove = Move(e.move);
         int s = fromTT(e.score, ply);
         ttScoreQ = s; ttFlagQ = e.flag(); ttEvalQ = e.eval;
-        if (e.flag() == EXACT) return s;
-        if (e.flag() == LOWER && s >= beta) return s;
-        if (e.flag() == UPPER && s <= alpha) return s;
+        const bool ttCut = e.flag() == EXACT || (e.flag() == LOWER && s >= beta) || (e.flag() == UPPER && s <= alpha);
+        if (ttCut) {
+            // tt says this quiet move fails high: learn it
+            if (TT_CUT_HIST_DIV && s >= beta && depth < TT_CUT_HIST_MAX_DEPTH && !(ttMove == Move()) &&
+                b.at(ttMove.from()).color() == b.sideToMove() &&                      // sanity: tt move must start on our piece
+                !b.isCapture(ttMove) && ttMove.typeOf() != Move::PROMOTION) {
+                    const int sd = sideIdx(b);
+                    const int bonus = std::min(HIST_B_MUL * depth - HIST_B_BASE, HIST_B_MAX) / TT_CUT_HIST_DIV;
+                    updateQuiet(td, b, sd, ply, ttMove, bonus, pawnHistIdx(b));
+                    if (td.stkTo[ply] >= 0 && td.stkQuiet[ply]) {
+                        const int prevCur = curIdx(sd ^ 1, td.stkPt[ply], td.stkTo[ply]);
+                        for (int k = 0; k < 3; ++k) {
+                            cost int p = ply - 1 - CH_BACK[k];
+                            if (p >= 0 && td.stkTo[p] >= 0) gravity(td.contHist[k][td.stkPt[p] * 64 + td.stkTo[p]][prevCur], -bonus);
+                        }
+                    }
+                }
+                return s;
+        }
     }
 
     Movelist moves;
@@ -1114,9 +1145,9 @@ static inline CorrIdx corrIdx(const ThreadData& td, const Board& b, int ply) {
 
 // static eval + learned correction
 static inline int correctEvalIx(const ThreadData& td, const CorrIdx& ix, int side, int halfMove, int eval) {
-    const int sum = 4 * td.corrHist[side][ix.pawn] + 2 * td.corrMinor[side][ix.minor] +
-                    2 * td.corrNonPawn[0][side][ix.npw] + 2 * td.corrNonPawn[1][side][ix.npb] +
-                    2 * td.corrCont[side][ix.cont];
+    const int sum = 4 * corrLoad(g_corr.pawn[side][ix.pawn]) + 2 * corrLoad(g_corr.minor[side][ix.minor]) +
+                    2 * corrLoad(g_corr.nonPawn[0][side][ix.npw]) + 2 * corrLoad(g_corr.nonPawn[1][side][ix.npb]) +
+                    2 * corrLoad(g_corr.cont[side][ix.cont]);
     int c = sum / (CORR_GRAIN * CORR_DIV);
     c = std::max(-CORR_MAX_TOTAL, std::min(CORR_MAX_TOTAL, c));
     // 50 move rule: eval shrinks as halfmove clock grows
@@ -1133,12 +1164,13 @@ static inline int correctEval(const ThreadData& td, const Board& b, int side, in
 static inline void updateCorr(ThreadData& td, const CorrIdx& ix, int side, int depth, int diff) {
     const int target = std::max(-CORR_MAX_CP, std::min(CORR_MAX_CP, diff)) * CORR_GRAIN;
     const int w = std::min(depth + 1, 16);
-    auto upd = [&](int16_t& e) { e = (int16_t)(e + (target - e) * w / 256); };
-    upd(td.corrHist[side][ix.pawn]);
-    upd(td.corrMinor[side][ix.minor]);
-    upd(td.corrNonPawn[0][side][ix.npw]);
-    upd(td.corrNonPawn[1][side][ix.npb]);
-    upd(td.corrCont[side][ix.cont]);
+    (void)td;
+    auto upd = [&](int16_t& e) { const int v = corrLoad(e); corrStore(e, v + (target - v) * w / 256); };
+    upd(g_corr.pawn[side][ix.pawn]);
+    upd(g_corr.minor[side][ix.minor]);
+    upd(g_corr.nonPawn[0][side][ix.npw]);
+    upd(g_corr.nonPawn[1][side][ix.npb]);
+    upd(g_corr.cont[side][ix.cont]);
 }
 
 // corrected root eval, plies 2 and 4 read it for improving
@@ -1157,6 +1189,8 @@ static bool hasNonPawnMaterial(const Board& b) {
 // cutNode: expected to fail high
 static int negamax(ThreadData& td, Board& b, int depth, int alpha, int beta, int ply, bool canNull, bool cutNode, Move excluded = Move()) {
     checkTime(td);
+    const int priorRed = td.stkRed[ply];              // reduction the parent used for this node, consumed here
+    td.stkRed[ply] = 0;
     td.pvLen[ply] = ply;                              // empty pv until alpha is raised in a pv node
     td.posKey[ply] = b.hash();
     if (b.isInsufficientMaterial() || b.isHalfMoveDraw() || isRepeated(td, b, ply)) return drawScore(td);
@@ -1229,7 +1263,14 @@ static int negamax(ThreadData& td, Board& b, int depth, int alpha, int beta, int
     }
 
     // iir
-    if (!singular && depth >= IIR_MIN_DEPTH && ttMove == Move()) --depth;
+    if (!singular && depth >= IIR_MIN_DEPTH && ttMove == Move()) {
+        const bool recentExact = pvNode && ttDepth >= 0 && ttFlag == EXACT && ttDepth >= depth - IIR_PV_EXACT_SLACK;
+        if (!recentExact) {
+            const int d0 = depth;
+            --depth;
+            if (cutNode && d0 >= IIR_CUT_MIN_DEPTH) --depth;
+        }
+    }
 
     // static eval when not in check
     const bool prunable = !pvNode && !inCheck && std::abs(beta) < MATE_BOUND;
@@ -1264,6 +1305,24 @@ static int negamax(ThreadData& td, Board& b, int depth, int alpha, int beta, int
         if (prev != NO_EVAL) evalGain = staticEval - prev;
     }
 
+    // eval jump vs the parent's eval: the quiet move that led here was better / worse than the parent thought  
+    if (EVAL_HIST_MUL && !inCheck && !singluar && ply >= 1 && td.stkTo[ply] >= 0 && td.stkQuiet[ply] &&
+        td.evalStack[ply - 1] != NO_EVAL) {
+        const int eb = std::max(-EVAL_HIST_MAX, std::min(EVAL_HIST_MAX, -EVAL_HIST_MUL * (staticEval + td.evalStack[ply - 1])));
+        const int prevCur = curIdx(side ^ 1, td.stkPt[ply], td.stkTo[ply]);
+        for (int k = 0; k < 3; ++k) {
+            const int p = ply - 1 - CH_BACK[k];
+            if (p >= 0 && td.stkTo[p] >= 0) gravity(td.contHist[k][td.stkPt[p] * 64 + td.stkTo[p]][prevCurl], eb);
+        }
+    }
+
+    // hindsight depth: look at the eval trend from the parent, before any pruning uses depth
+    if (HINDSIGHT_INC_RED && !inCheck && !singular && ply >= 1 && td.evalStack[ply - 1] != NO_EVAL) {
+        const int trend = staticEval + td.evalStack[ply - 1];          // > 0: the parent's move made its eval worse
+        if (priorRed >= HINDSIGHT_INC_RED && trend <= HINDSIGHT_WORSENING) ++depth;               // reduced a lot, eval says it was fine
+        else if (priorRed >= HINDSIGHT_DEC_RED && depth >= 2 && trend > HINDSIGHT_MARGIN) --depth;   // eval confirms the reduction
+    }
+
     if (prunable && !singular && depth <= RAZOR_MAX_DEPTH && pruneEval + RAZOR_BASE + RAZOR_MARGIN * depth <= alpha) {
         const int v = quiesce(td, b, alpha - 1, alpha, ply);
         if (v < alpha) return v;
@@ -1271,7 +1330,7 @@ static int negamax(ThreadData& td, Board& b, int depth, int alpha, int beta, int
 
     // rfp, improving side needs a smaller margin
     if (prunable && !singular && depth <= RFP_MAX_DEPTH && pruneEval - RFP_MARGIN * (depth - improving) >= beta && !nodePv && hasNonPawnMaterial(b))
-        return pruneEval - RFP_MARGIN * (depth - improving);
+        return (pruneEval + beta) / 2;
 
     // --- null move ---
     if (!pvNode && canNull && !inCheck && depth >= NMP_MIN_DEPTH && ply >= td.nmpMinPly &&
@@ -1408,7 +1467,8 @@ static int negamax(ThreadData& td, Board& b, int depth, int alpha, int beta, int
             // adjustments below push r up or down
             int r = 0;
             const bool badCapture = !quiet && m.score() < S_BAD_THRESH;
-            if (depth >= LMR_MIN_DEPTH && i >= LMR_MIN_MOVES && (quiet || badCapture) && !inCheck && !b.inCheck()) {
+            const bool goodCapture = LMR_GOOD_CAPS && !quiet && !badCapture && b.isCapture(m) && m.typeOf() != Move::PROMOTION;
+            if (depth >= LMR_MIN_DEPTH && i >= LMR_MIN_MOVES && (quiet || badCapture || goodCapture) && !inCheck && !b.inCheck()) {
                 r = LMR[std::min(depth, 63)][std::min(i, 63)];
                 if (pvNode) --r;                            // pv: reduce less
                 if (isKiller) --r;
@@ -1427,8 +1487,10 @@ static int negamax(ThreadData& td, Board& b, int depth, int alpha, int beta, int
                 if (ttNoisy && quiet) ++r;                  // tt move is a capture, quiets rarely beat it
                 if (badCapture) --r;                        // bad caps, careful
                 r -= quiet ? h / 16384 : h / 4096;          // good hist reduce less, bad more
+                if (goodCapture) r = std::min(r - 1, LMR_GOOD_CAP_MAX);        // good caps: reduce less.
                 r = std::max(0, std::min(r, depth - 2));
             }
+            td.stkRed[ply + 1] = r;
             s = -negamax(td, b, depth - 1 - r, -alpha - 1, -alpha, ply + 1, true, !cutNode);
             if (s > alpha && r > 0) {                      // reduced search beat alpha, verify
                 int nd = depth - 1;
