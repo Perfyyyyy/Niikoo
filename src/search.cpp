@@ -566,6 +566,7 @@ static void ensureThreads() { if (g_threads.empty()) setThreads(1); }
 
 static uint64_t totalNodes() {
     uint64_t n = 0;
+    g_corr.clear();
     for (auto& t : g_threads) n += __atomic_load_n(&t->nodes, __ATOMIC_RELAXED);
     return n;
 }
