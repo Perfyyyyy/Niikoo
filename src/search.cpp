@@ -434,6 +434,21 @@ static inline void accSetMove(ThreadData& td, const Board& b, const Move m, int 
         if (victim <= 5) sub(us ^ 1, victim, to);
         add(us, type == Move::PROMOTION ? (int)m.promotionType() : pt, to);
     }
+    // warm the first-layer rows the lazy update at evalAt will read (skip if the paret acc isn't valid,
+    // or if this side's own king moves, because that perspective refreshes via the Finny cache instead)
+    if (ply >= 1 && td.accValid[ply - 1]) {
+        for (int p = 0; p < 2; ++p) {
+            bool ownKing = false;
+            for (int i = 0; i < d.nadd; ++i)
+                if (d.add[i].pt == 5 && d.add[i].colour == p) ownKing = true;
+            if (ownKing) continue;
+            const int key = td.accKey[ply - 1][p];
+            for (int i = 0; i < d.nsub; ++i)
+                nnue::prefetchFeature(nnue::featureIndex(p, key, d.sub[i].colour, d.sub[i].pt, d.sub[i].sq));
+            for (int i = 0; i < d.nadd; ++i)
+                nnue::prefetchFeature(nnue::featureIndex(p, key, d.add[i].colour, d.add[i].pt, d.add[i].sq));
+        }
+    }
 }
 
 static inline void accSetNull(ThreadData& td, int ply) {   // null move: nothing changes

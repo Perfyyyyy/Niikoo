@@ -5,6 +5,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <new>
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #include <cpuid.h>
@@ -46,10 +50,38 @@
 
 namespace nnue {
 
+namespace{
+
+// 2 MB aligned storage for the big first-layer table: rows start on cache lines, and on linux the table can sit
+// on huge pages (rows are read at random, with 4 KB pages that is a TLB miss per row)
+template <class T> struct BigAlloc {
+    using value_type = T;
+#ifdef __linux__
+    static constexpr size_t ALIGN = 2u << 20;
+#else
+    static constexpr size_t ALIGN = 64;
+#endif
+    BigAlloc() = default;
+    template <class U> BigAlloc(const BigAlloc<U>&) {}
+    T* allocate(size_t n) {
+        const size_t sz = (n * sizeof(T) + ALIGN - 1) / ALIGN * ALIGN;
+        void* p = ::operator new(sz, std::align_val_t(ALIGN));
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+        madvise(p, sz, MADV_HUGEPAGE);
+#endif
+        return (T*)p;
+    }
+    void deallocate(T* p, size_t) { ::operator delete(p, std::align_val_t(ALIGN)); }
+};
+template <class T, class U> bool operator==(const BigAlloc<T>&, const BigAlloc<U>&) { return true; }
+template <class T, class U> bool operator!=(const BigAlloc<T>&, const BigAlloc<U>&) { return false; }
+} // namespace
+
 namespace {
 struct Net {
     int hidden = 0, qa = 255, qw = 512, scale = 400;
-    std::vector<int16_t> ftW, ftB;
+    std::vector<int16_t>, BigAlloc<int16_t>> ftW;
+    std::vector<int16_t> ftB;
     std::vector<int8_t>  l2W8;                      // [bucket][L2][L1], rows rescaled to max|w| <= 64
     std::vector<float>   s2;                        // [bucket][L2]: 1 / (PSCALE * QW * rowScale)
     std::vector<float>   l2B, l3WT, l3B, outW, outB;   // l3WT is [bucket][L2][L3] (transposed)
@@ -77,9 +109,9 @@ struct Cursor {
     }
 };
 
-template <class T>
-bool readVec(Cursor& c, std::vector<T>& v, size_t n) {
-    if (n > c.left / sizeof(T)) return false;       // also keeps a bogus header from asking for a huge allocation
+template <class V>
+bool readVec(Cursor& c, V& v, size_t n) {
+    if (n > c.left / sizeof(T)) return false;
     v.resize(n);
     return c.read(v.data(), n * sizeof(T));
 }

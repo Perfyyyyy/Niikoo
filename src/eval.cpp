@@ -34,6 +34,13 @@ int nnueAdjust(const Board& b, int stmScore) {
     const int mask = g_nnEgMask;
     if (!mask) return stmScore;
 
+    // cheap early exit: phase from 4 combined bitboards, full counts only for thin endings
+    const int quickPhase =
+        popcnt(b.pieces(PieceType::KNIGHT).getBits() | b.pieces(PieceType::BISHOP).getBits()) +
+        2 * popcnt(b.pieces(PieceType::ROOK).getBits()) +
+        4 * popcnt(b.pieces(PieceType::QUEEN).getBits());
+    if (quickPhase > 10) return stmScore;
+
     int cnt[2][5];                                          // P N B R Q per colour
     U64 bishops[2];
     int phase = 0;
