@@ -80,7 +80,7 @@ template <class T, class U> bool operator!=(const BigAlloc<T>&, const BigAlloc<U
 namespace {
 struct Net {
     int hidden = 0, qa = 255, qw = 512, scale = 400;
-    std::vector<int16_t>, BigAlloc<int16_t>> ftW;
+    std::vector<int16_t BigAlloc<int16_t>> ftW;
     std::vector<int16_t> ftB;
     std::vector<int8_t>  l2W8;                      // [bucket][L2][L1], rows rescaled to max|w| <= 64
     std::vector<float>   s2;                        // [bucket][L2]: 1 / (PSCALE * QW * rowScale)
@@ -111,6 +111,7 @@ struct Cursor {
 
 template <class V>
 bool readVec(Cursor& c, V& v, size_t n) {
+    using T = typename V::value_type;
     if (n > c.left / sizeof(T)) return false;
     v.resize(n);
     return c.read(v.data(), n * sizeof(T));
