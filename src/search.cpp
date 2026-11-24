@@ -60,8 +60,6 @@ static const int RFP_MAX_DEPTH = 6, RFP_MARGIN = 80;                    // rfp
 static const int FP_MAX_DEPTH  = 4, FP_BASE = 120, FP_MARGIN = 100;     // fp
 static const int LMP_MAX_DEPTH = 4;                                     // lmp
 static const int IIR_MIN_DEPTH = 4;                                     // iir
-static const int IIR_CUT_MIN_DEPTH = 6;                                 // cut nodes without a tt move lose a 2nd ply from here
-static const int IIR_PV_EXACT_SLACK = 3;                                // pv nodes skip iir when tt has an exact entry this close to depth
 static const int SE_MIN_DEPTH = 7, SE_MARGIN = 2;                       // singular, margin = SE_MARGIN * depth
 static const int RAZOR_MAX_DEPTH = 3, RAZOR_BASE = 200, RAZOR_MARGIN = 150;   // razoring
 static const int PROBCUT_MIN_DEPTH = 5, PROBCUT_MARGIN = 160, PROBCUT_REDUCTION = 4;
@@ -1267,15 +1265,7 @@ static int negamax(ThreadData& td, Board& b, int depth, int alpha, int beta, int
     }
 
     // iir
-    // depends on node type: cut nodes reduce more, pv nodes with a recent exact entry skip it
-    if (!singular && depth >= IIR_MIN_DEPTH && ttMove == Move()) {
-        const bool recentExact = pvNode && ttDepth >= 0 && ttFlag == EXACT && ttDepth >= depth - IIR_PV_EXACT_SLACK;
-        if (!recentExact) {
-            const int d0 = depth;
-            --depth;
-            if (cutNode && d0 >= IIR_CUT_MIN_DEPTH) --depth;
-        }
-    }
+    if (!singular && depth >= IIR_MIN_DEPTH && ttMove == Move()) --depth;
 
     // static eval when not in check
     const bool prunable = !pvNode && !inCheck && std::abs(beta) < MATE_BOUND;
@@ -1335,7 +1325,7 @@ static int negamax(ThreadData& td, Board& b, int depth, int alpha, int beta, int
 
     // rfp, improving side needs a smaller margin
     if (prunable && !singular && depth <= RFP_MAX_DEPTH && pruneEval - RFP_MARGIN * (depth - improving) >= beta && !nodePv && hasNonPawnMaterial(b))
-        return (pruneEval + beta) / 2;                 // blend toward beta instead of returning the raw eval (still >= beta)
+        return pruneEval - RFP_MARGIN * (depth - improving);
 
     // --- null move ---
     if (!pvNode && canNull && !inCheck && depth >= NMP_MIN_DEPTH && ply >= td.nmpMinPly &&
