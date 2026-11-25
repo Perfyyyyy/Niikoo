@@ -531,6 +531,15 @@ class Board {
         return (t.pawn[1][sq] & bb_[0] & occ_[0]) | (t.pawn[0][sq] & bb_[0] & occ_[1]) | (t.knight[sq] & bb_[1]) |
                (t.king[sq] & bb_[5]) | (t.bishopAtt(sq, occ) & (bb_[2] | bb_[4])) | (t.rookAtt(sq, occ) & (bb_[3] | bb_[4]));
     }
+    bool attackedBy(int sq, u64 occ, int by) const {
+        const fb::Tables& t = fb::g_t;
+        const u64 o = occ_[by];
+        if (t.pawn[by ^ 1][sq] & bb_[0] & o) return true;
+        if (t.knight[sq] & bb_[1] & o) return true;
+        if (t.king[sq] & bb_[5] & o) return true;
+        if (t.bishopAtt(sq, occ) & (bb_[2] | bb_[4]) & o) return true;
+        return (t.rookAtt(sq, occ) & (bb_[3] | bb_[4]) & o) != 0;
+    }
     bool isAttacked(Square s, Color by) const { return (attackersTo(s.index(), occ_[0] | occ_[1]) & occ_[(int)by]) != 0; }
     Bitboard attackers(Color by, Square s) const { return Bitboard(attackersTo(s.index(), occ_[0] | occ_[1]) & occ_[(int)by]); }
 
@@ -549,6 +558,9 @@ class Board {
                 const u64 light = 0x55AA55AA55AA55AAULL;
                 return ((wb & light) != 0) == ((bbk & light) != 0);
             }
+            const u64 light = 0x55AA55AA55AA55AAULL;
+            if (fb::popcount(wb) == 2) { const u64 x = wb & light; return x == 0 || x == wb; }
+            if (fb::popcount(bbk) == 2) { const u64 x = bbk & light; return x == 0 || x == bbk; }
         }
         return false;
     }
@@ -558,7 +570,7 @@ class Board {
     bool isRepetition(int count = 2) const {
         int c = 0;
         const int n = (int)st_.size();
-        const int lim = std::max(0, n - (int)halfmove_);
+        const int lim = std::max(0, n - (int)halfmove_ - 1);
         for (int i = n - 2; i >= lim; i -= 2)
             if (st_[i].hash == hash_ && ++c >= count) return true;
         return false;
@@ -606,7 +618,13 @@ class Board {
         stm_ = Color(ci ^ 1);
         hash_ ^= t.zSide;
         if (ci == 1) ++fullmove_;
-        checkers_ = attackersTo(fb::lsb(bb_[5] & occ_[ci ^ 1]), occ_[0] | occ_[1]) & occ_[ci];
+        {
+            const int k = fb::lsb(bb_[5] & occ_[ci ^ 1]);
+            const u64 o = occ_[0] | occ_[1];
+            // only the mover's pieces can give check: skip the king term and the other colour's pawns
+            checkers_ = ((t.pawn[ci ^ 1][k] & bb_[0]) | (t.knight[k] & bb_[1]) |
+                         (t.bishopAtt(k, o) & (bb_[2] | bb_[4])) | (t.rookAtt(k, o) & (bb_[3] | bb_[4]))) & occ_[ci];
+        }
         st_.push_back(s);
     }
 
@@ -638,7 +656,6 @@ class Board {
         State s{hash_, checkers_, (std::uint8_t)castling_, (std::uint8_t)ep_, (std::uint16_t)halfmove_, (std::uint8_t)Piece::NONE};
         if (ep_ < 64) hash_ ^= t.zEp[ep_ & 7];
         ep_ = 64;
-        ++halfmove_;
         stm_ = Color((int)stm_ ^ 1);
         hash_ ^= t.zSide;
         checkers_ = 0;   // the side that just "moved" is never in check when it passes
@@ -809,6 +826,9 @@ inline std::string Board::getFen() const {
 namespace movegen {
 enum class MoveGenType : std::uint8_t { ALL, CAPTURE, QUIET };
 
+// Generation order is identical to the chess.hpp library (so search tie-breaks behave the same):
+//   king, castling (ascending rook square), pawns [promo capture L, promo capture R, promo push, capture L, capture R,
+//   single push, double push, en passant] (each ascending by destination), then N, B, R, Q (ascending from, then to).
 template <MoveGenType MT = MoveGenType::ALL>
 inline void legalmoves(Movelist& ml, const Board& b) {
     using fb::bit;
@@ -827,17 +847,6 @@ inline void legalmoves(Movelist& ml, const Board& b) {
     const fb::u64 tgt = MT == MoveGenType::ALL ? ~0ULL : (MT == MoveGenType::CAPTURE ? theirs : ~occ);
 
     auto add = [&](int from, int to) { ml.add(Move::make(Square(from), Square(to))); };
-#ifdef FB_QUEEN_PROMO_IN_CAPTURES
-    // push-promotions: the queen one is a "capture-type" move (qsearch sees it), the under-promotions are quiet
-    auto addPromoPush = [&](int from, int to) {
-        if (MT != MoveGenType::QUIET) ml.add(Move::make<Move::PROMOTION>(Square(from), Square(to), PieceType::QUEEN));
-        if (MT != MoveGenType::CAPTURE) {
-            ml.add(Move::make<Move::PROMOTION>(Square(from), Square(to), PieceType::ROOK));
-            ml.add(Move::make<Move::PROMOTION>(Square(from), Square(to), PieceType::BISHOP));
-            ml.add(Move::make<Move::PROMOTION>(Square(from), Square(to), PieceType::KNIGHT));
-        }
-    };
-#endif
     auto addPromo = [&](int from, int to) {
         ml.add(Move::make<Move::PROMOTION>(Square(from), Square(to), PieceType::QUEEN));
         ml.add(Move::make<Move::PROMOTION>(Square(from), Square(to), PieceType::ROOK));
@@ -845,15 +854,40 @@ inline void legalmoves(Movelist& ml, const Board& b) {
         ml.add(Move::make<Move::PROMOTION>(Square(from), Square(to), PieceType::KNIGHT));
     };
 
-    // king moves, destination must not be attacked with the king lifted off the board
+    // 1) king moves, destination must not be attacked with the king lifted off the board
     {
         fb::u64 km = t.king[ksq] & ~ours & tgt;
         const fb::u64 occNoK = occ ^ bit(ksq);
         while (km) {
             const int to = poplsb(km);
-            if (!(b.attackersTo(to, occNoK) & theirs)) add(ksq, to);
+            if (!b.attackedBy(to, occNoK, them)) add(ksq, to);
         }
     }
+
+    // 2) castling (king -> own rook square), only when not in check; emitted in ascending rook square
+    if (MT != MoveGenType::CAPTURE && nchk == 0) {
+        const int rights = b.rawCastling();
+        Move cm[2];
+        int nc = 0;
+        for (int side = 0; side < 2; ++side) {
+            const int idx = us * 2 + side;
+            if (!(rights & (1 << idx))) continue;
+            const int rfrom = b.rawCastleRook(idx), base = ksq & 56;
+            const int kto = base + (side == 0 ? 6 : 2), rto = base + (side == 0 ? 5 : 3);
+            const fb::u64 path = (t.between[ksq][kto] | t.between[rfrom][rto] | bit(kto) | bit(rto)) & ~(bit(ksq) | bit(rfrom));
+            if (occ & path) continue;
+            const fb::u64 occ2 = occ ^ bit(ksq) ^ bit(rfrom);
+            fb::u64 kp = t.between[ksq][kto] | bit(kto);
+            bool ok = true;
+            while (kp) {
+                if (b.attackedBy(poplsb(kp), occ2, them)) { ok = false; break; }
+            }
+            if (ok) cm[nc++] = Move::make<Move::CASTLING>(Square(ksq), Square(rfrom));
+        }
+        if (nc == 2 && cm[1].to().index() < cm[0].to().index()) std::swap(cm[0], cm[1]);
+        for (int i = 0; i < nc; ++i) ml.add(cm[i]);
+    }
+
     if (nchk >= 2) return;
 
     const fb::u64 checkmask = nchk == 1 ? (t.between[ksq][lsb(checkers)] | checkers) : ~0ULL;
@@ -873,7 +907,87 @@ inline void legalmoves(Movelist& ml, const Board& b) {
         }
     }
 
-    // knights, bishops, rooks, queens
+    // 3) pawns (bulk, shift based; pinned pawns are folded in individually)
+    {
+        const fb::u64 pawns = b.rawBB(0) & ours;
+        const int up = us == 0 ? 8 : -8, dl = us == 0 ? 7 : -7, dr = us == 0 ? 9 : -9;   // "left"/"right" as in the library
+        const fb::u64 promoMask = us == 0 ? fb::RANK_8 : fb::RANK_1;
+        const fb::u64 third = us == 0 ? 0x0000000000FF0000ULL : 0x0000FF0000000000ULL;
+        const fb::u64 lMask = us == 0 ? ~fb::FILE_A : ~fb::FILE_H;
+        const fb::u64 rMask = us == 0 ? ~fb::FILE_H : ~fb::FILE_A;
+        auto sh = [](fb::u64 x, int d) { return d > 0 ? x << d : x >> -d; };
+
+        const fb::u64 freeP = pawns & ~pinned;
+        fb::u64 l = sh(freeP & lMask, dl), r = sh(freeP & rMask, dr);
+        fb::u64 sp = sh(freeP, up) & ~occ;
+        fb::u64 pp = pawns & pinned;
+        while (pp) {
+            const int from = poplsb(pp);
+            const fb::u64 ray = pinRay[from], pb = bit(from);
+            l |= sh(pb & lMask, dl) & ray;
+            r |= sh(pb & rMask, dr) & ray;
+            sp |= sh(pb, up) & ray & ~occ;
+        }
+        l &= theirs & checkmask;
+        r &= theirs & checkmask;
+        fb::u64 two = sh(sp & third, up) & ~occ & checkmask;
+        const fb::u64 one = sp & checkmask;
+
+        fb::u64 x;
+        if (MT != MoveGenType::QUIET) {
+            x = l & promoMask;
+            while (x) { const int to = poplsb(x); addPromo(to - dl, to); }
+            x = r & promoMask;
+            while (x) { const int to = poplsb(x); addPromo(to - dr, to); }
+        }
+#ifdef FB_QUEEN_PROMO_IN_CAPTURES
+        // optional behaviour change: the queen push-promotion is a capture-type move, the under-promotions are quiet
+        x = one & promoMask;
+        while (x) {
+            const int to = poplsb(x), from = to - up;
+            if (MT != MoveGenType::QUIET) ml.add(Move::make<Move::PROMOTION>(Square(from), Square(to), PieceType::QUEEN));
+            if (MT != MoveGenType::CAPTURE) {
+                ml.add(Move::make<Move::PROMOTION>(Square(from), Square(to), PieceType::ROOK));
+                ml.add(Move::make<Move::PROMOTION>(Square(from), Square(to), PieceType::BISHOP));
+                ml.add(Move::make<Move::PROMOTION>(Square(from), Square(to), PieceType::KNIGHT));
+            }
+        }
+#else
+        if (MT != MoveGenType::CAPTURE) {   // default: all push-promotions are QUIET moves, as in the original header
+            x = one & promoMask;
+            while (x) { const int to = poplsb(x); addPromo(to - up, to); }
+        }
+#endif
+        if (MT != MoveGenType::QUIET) {
+            x = l & ~promoMask;
+            while (x) { const int to = poplsb(x); add(to - dl, to); }
+            x = r & ~promoMask;
+            while (x) { const int to = poplsb(x); add(to - dr, to); }
+        }
+        if (MT != MoveGenType::CAPTURE) {
+            x = one & ~promoMask;
+            while (x) { const int to = poplsb(x); add(to - up, to); }
+            while (two) { const int to = poplsb(two); add(to - 2 * up, to); }
+        }
+
+        // en passant: always verified by playing it out on the occupancy
+        const int ep = b.rawEp();
+        if (MT != MoveGenType::QUIET && ep < 64) {
+            const int cap = ep + (us == 0 ? -8 : 8);
+            if (nchk == 0 || (checkmask & (bit(ep) | bit(cap)))) {
+                fb::u64 cand = t.pawn[them][ep] & pawns;
+                const fb::u64 rq = (b.rawBB(3) | b.rawBB(4)) & theirs, bq = (b.rawBB(2) | b.rawBB(4)) & theirs;
+                while (cand) {
+                    const int from = poplsb(cand);
+                    const fb::u64 occ2 = (occ ^ bit(from) ^ bit(cap)) | bit(ep);
+                    if (!((t.rookAtt(ksq, occ2) & rq) | (t.bishopAtt(ksq, occ2) & bq)))
+                        ml.add(Move::make<Move::ENPASSANT>(Square(from), Square(ep)));
+                }
+            }
+        }
+    }
+
+    // 4) knights, bishops, rooks, queens
     for (int pt = 1; pt <= 4; ++pt) {
         fb::u64 pcs = b.rawBB(pt) & ours;
         while (pcs) {
@@ -888,83 +1002,6 @@ inline void legalmoves(Movelist& ml, const Board& b) {
             att &= ~ours & checkmask & tgt;
             if (pinned & bit(from)) att &= pinRay[from];
             while (att) add(from, poplsb(att));
-        }
-    }
-
-    // pawns
-    {
-        const int up = us == 0 ? 8 : -8;
-        const fb::u64 promoMask = us == 0 ? fb::RANK_8 : fb::RANK_1;
-        const fb::u64 startRank = us == 0 ? 0x000000000000FF00ULL : 0x00FF000000000000ULL;
-        fb::u64 pawns = b.rawBB(0) & ours;
-        while (pawns) {
-            const int from = poplsb(pawns);
-            const fb::u64 allowed = checkmask & ((pinned & bit(from)) ? pinRay[from] : ~0ULL);
-#ifdef FB_QUEEN_PROMO_IN_CAPTURES
-            {   // optional behaviour change: the queen push-promotion is a capture-type move (Stockfish-style qsearch)
-                const int one = from + up;
-                if (!(occ & bit(one))) {
-                    if (allowed & bit(one)) {
-                        if (promoMask & bit(one)) addPromoPush(from, one);
-                        else if (MT != MoveGenType::CAPTURE) add(from, one);
-                    }
-                    if (MT != MoveGenType::CAPTURE && (startRank & bit(from)) && !(occ & bit(one + up)) && (allowed & bit(one + up)))
-                        add(from, one + up);
-                }
-            }
-#else
-            if (MT != MoveGenType::CAPTURE) {   // default: all push-promotions are QUIET moves, as in the original header
-                const int one = from + up;
-                if (!(occ & bit(one))) {
-                    if (allowed & bit(one)) {
-                        if (promoMask & bit(one)) addPromo(from, one); else add(from, one);
-                    }
-                    if ((startRank & bit(from)) && !(occ & bit(one + up)) && (allowed & bit(one + up))) add(from, one + up);
-                }
-            }
-#endif
-            if (MT != MoveGenType::QUIET) {
-                fb::u64 caps = t.pawn[us][from] & theirs & allowed;
-                while (caps) {
-                    const int to = poplsb(caps);
-                    if (promoMask & bit(to)) addPromo(from, to); else add(from, to);
-                }
-            }
-        }
-        // en passant: always verified by playing it out on the occupancy
-        const int ep = b.rawEp();
-        if (MT != MoveGenType::QUIET && ep < 64) {
-            const int cap = ep + (us == 0 ? -8 : 8);
-            if (nchk == 0 || (checkmask & (bit(ep) | bit(cap)))) {
-                fb::u64 cand = t.pawn[them][ep] & b.rawBB(0) & ours;
-                const fb::u64 rq = (b.rawBB(3) | b.rawBB(4)) & theirs, bq = (b.rawBB(2) | b.rawBB(4)) & theirs;
-                while (cand) {
-                    const int from = poplsb(cand);
-                    const fb::u64 occ2 = (occ ^ bit(from) ^ bit(cap)) | bit(ep);
-                    if (!((t.rookAtt(ksq, occ2) & rq) | (t.bishopAtt(ksq, occ2) & bq)))
-                        ml.add(Move::make<Move::ENPASSANT>(Square(from), Square(ep)));
-                }
-            }
-        }
-    }
-
-    // castling (king -> own rook square), only when not in check
-    if (MT != MoveGenType::CAPTURE && nchk == 0) {
-        const int rights = b.rawCastling();
-        for (int side = 0; side < 2; ++side) {
-            const int idx = us * 2 + side;
-            if (!(rights & (1 << idx))) continue;
-            const int rfrom = b.rawCastleRook(idx), base = ksq & 56;
-            const int kto = base + (side == 0 ? 6 : 2), rto = base + (side == 0 ? 5 : 3);
-            const fb::u64 path = (t.between[ksq][kto] | t.between[rfrom][rto] | bit(kto) | bit(rto)) & ~(bit(ksq) | bit(rfrom));
-            if (occ & path) continue;
-            const fb::u64 occ2 = occ ^ bit(ksq) ^ bit(rfrom);
-            fb::u64 kp = t.between[ksq][kto] | bit(kto);
-            bool ok = true;
-            while (kp) {
-                if (b.attackersTo(poplsb(kp), occ2) & theirs) { ok = false; break; }
-            }
-            if (ok) ml.add(Move::make<Move::CASTLING>(Square(ksq), Square(rfrom)));
         }
     }
 }
