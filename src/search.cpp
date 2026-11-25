@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -1164,6 +1165,25 @@ static bool hasNonPawnMaterial(const Board& b) {
 
 // ---- main search ----
 // cutNode: expected to fail high
+// ---- staged move picking helpers ----
+// best remaining move in l[idx..] with score >= minScore: swap it to idx, return it, advance idx
+static inline bool pickBest(Movelist& l, int& idx, int minScore, Move& out) {
+    const int n = l.size();
+    if (idx >= n) return false;
+    int bi = idx;
+    for (int j = idx + 1; j < n; ++j)
+        if (l[j].score() > l[bi].score()) bi = j;
+    if (l[bi].score() < minScore) return false;
+    if (bi != idx) std::swap(l[idx], l[bi]);
+    out = l[idx++];
+    return true;
+}
+static inline bool inMoveList(const Movelist& l, const Move& m) {
+    for (int j = 0; j < l.size(); ++j)
+        if (l[j] == m) return true;
+    return false;
+}
+
 static int negamax(ThreadData& td, Board& b, int depth, int alpha, int beta, int ply, bool canNull, bool cutNode, Move excluded = Move()) {
     checkTime(td);
     td.pvLen[ply] = ply;                              // empty pv until alpha is raised in a pv node
@@ -1337,10 +1357,70 @@ static int negamax(ThreadData& td, Board& b, int depth, int alpha, int beta, int
         }
     }
 
-    Movelist moves;
-    movegen::legalmoves(moves, b);
-    if (moves.empty()) return inCheck ? -(MATE - ply) : 0;
+    // ---- staged move generation ----
+    // order: tt move, good caps/promos, quiets (killers/counter/history), bad caps. same order as the old full sort,
+    // but quiets are only generated + scored if the earlier stages didn't cut off. in check: everything in one list
+    Movelist moves;                                    // caps + promos (everything when in check)
+    Movelist qmoves;                                   // quiets, filled on demand
+    const bool allAtOnce = inCheck;
+    bool qGen = false, qScored = false;
+    int capIdx = 0, qIdx = 0;
+    if (allAtOnce) movegen::legalmoves(moves, b);
+    else           movegen::legalmoves<movegen::MoveGenType::CAPTURE>(moves, b);
     orderMoves(td, b, moves, ttMove, ply, true, ph);
+
+    // a quiet tt move has to be checked against the legal quiets before it can go first,
+    // so generate (but don't score) the quiets in that case
+    bool ttQuietOk = false;
+    if (!allAtOnce && !(ttMove == Move()) && !(b.isCapture(ttMove) || ttMove.typeOf() == Move::PROMOTION)) {
+        movegen::legalmoves<movegen::MoveGenType::QUIET>(qmoves, b);
+        qGen = true;
+        ttQuietOk = inMoveList(qmoves, ttMove);
+    }
+#ifdef STAGED_VERIFY
+    if (!allAtOnce) {                                  // caps U quiets must be exactly the legal moves
+        Movelist all, q;
+        movegen::legalmoves(all, b);
+        movegen::legalmoves<movegen::MoveGenType::QUIET>(q, b);
+        int cnt = moves.size();
+        for (int j = 0; j < q.size(); ++j) if (!inMoveList(moves, q[j])) ++cnt;
+        bool ok = cnt == all.size();
+        for (int j = 0; j < all.size(); ++j) ok = ok && (inMoveList(moves, all[j]) || inMoveList(q, all[j]));
+        if (!ok) { std::cerr << "staged movegen mismatch: fen " << b.getFen() << std::endl; std::abort(); }
+    }
+#endif
+    enum { ST_TTQ, ST_GOOD, ST_QUIET, ST_BAD, ST_END };
+    int stage = ttQuietOk ? ST_TTQ : ST_GOOD;
+    auto nextMove = [&](Move& out) -> bool {
+        for (;;) {
+            switch (stage) {
+            case ST_TTQ:
+                stage = ST_GOOD;
+                out = ttMove;
+                return true;
+            case ST_GOOD:
+                if (pickBest(moves, capIdx, allAtOnce ? INT_MIN : S_BAD_THRESH, out)) return true;
+                stage = allAtOnce ? ST_END : ST_QUIET;
+                break;
+            case ST_QUIET:
+                if (!qGen) { movegen::legalmoves<movegen::MoveGenType::QUIET>(qmoves, b); qGen = true; }
+                if (!qScored) { orderMoves(td, b, qmoves, ttMove, ply, true, ph); qScored = true; }
+                while (pickBest(qmoves, qIdx, INT_MIN, out)) {
+                    if (ttQuietOk && out == ttMove) continue;                                         // already tried first
+                    if (out.typeOf() == Move::PROMOTION && inMoveList(moves, out)) continue;          // in the caps list already
+                    return true;
+                }
+                stage = ST_BAD;
+                break;
+            case ST_BAD:
+                if (pickBest(moves, capIdx, INT_MIN, out)) return true;
+                stage = ST_END;
+                break;
+            default:
+                return false;
+            }
+        }
+    };
 
     int best = tbFloor;
     Move bestMove{};
@@ -1352,9 +1432,9 @@ static int negamax(ThreadData& td, Board& b, int depth, int alpha, int beta, int
     // lmr ctx: noisy tt move -> quiets probably worse, counter = quiet that already refuted the last move
     const bool ttNoisy = !(ttMove == Move()) && (b.isCapture(ttMove) || ttMove.typeOf() == Move::PROMOTION);
     const Move counter = td.stkTo[ply] >= 0 ? td.counterMove[td.stkPt[ply]][td.stkTo[ply]] : Move();
-    for (int i = 0; i < moves.size(); ++i) {
-        pickMove(moves, i);
-        const Move m = moves[i];
+    Move mNext{};
+    for (int i = 0; nextMove(mNext); ++i) {
+        const Move m = mNext;
         if (singular && m == excluded) continue;
         const bool quiet = !b.isCapture(m) && m.typeOf() != Move::PROMOTION;
         const bool isKiller = m == td.killers[ply][0] || m == td.killers[ply][1];
@@ -1489,6 +1569,8 @@ static int negamax(ThreadData& td, Board& b, int depth, int alpha, int beta, int
         if (quiet && nq < 64) quiets[nq++] = m;
         else if (!quiet && ncap < 32 && b.isCapture(m)) captures[ncap++] = m;
     }
+
+    if (moves.size() + qmoves.size() == 0) return inCheck ? -(MATE - ply) : 0;   // mate / stalemate
 
     if (pvNode && best > tbCeil) best = tbCeil;       // tb loss caps the score
 
