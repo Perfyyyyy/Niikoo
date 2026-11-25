@@ -1,7 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
-#include "chess.hpp"
+#include "fastboard.hpp"
 
 // Limits for one search. The hard limit aborts the search mid-iteration; the soft limit is checked
 // between iterations and is scaled by best-move stability, score drops and root-move effort.

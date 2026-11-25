@@ -1,6 +1,6 @@
 #pragma once
 #include <string>
-#include "chess.hpp"
+#include "fastboard.hpp"
 
 // Syzygy endgame tablebases through Fathom (tbprobe.c).
 
