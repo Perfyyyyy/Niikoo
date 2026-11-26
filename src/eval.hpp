@@ -1,6 +1,6 @@
 #pragma once
 #include <string>
-#include "chess.hpp"
+#include "fastboard.hpp"
 #include "nnue.hpp"
 
 int evaluate(const chess::Board& b);   // score from White's point of view (net if one is loaded, else handcrafted)
