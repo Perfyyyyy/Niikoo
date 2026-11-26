@@ -31,6 +31,8 @@ bool loadBook(const std::string& path) {
     for (size_t i = 0; i + 16 <= data.size(); i += 16)   // 16 bytes per entry
         book.push_back({be(&data[i], 8), (uint16_t)be(&data[i + 8], 2),
                         (uint16_t)be(&data[i + 10], 2)});
+    if (!book.empty() && !chess::polyglotHashOk())
+    std::cerr << "Warning: board hash is not Polyglot-compatible, the opening book will never match\n";
     return !book.empty();
 }
 
